@@ -1,0 +1,83 @@
+name: CI
+
+# Offline checks of the guardrail: lint, types and the tests, the LiteLLM glue's
+# included (against the LiteLLM release the guardrail is tested with). No
+# secrets, no CollieAi service, no publishing. Pull requests from forks run with
+# a read-only token; `CI required` is the single check branch protection
+# requires, and it fails unless every job below succeeded — a skipped or
+# cancelled job is not a pass.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  LITELLM: "litellm[proxy]==1.102.4"
+
+jobs:
+  python:
+    name: Python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # declared minimum and a current release LiteLLM supports
+        python: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install the guardrail, its dev tools and LiteLLM
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]" "$LITELLM"
+      - name: Lint and types
+        run: |
+          python -m ruff check collieai_guardrail tests
+          python -m ruff format --check collieai_guardrail tests
+          python -m mypy collieai_guardrail
+      - name: Tests (nothing may be skipped)
+        run: |
+          python -m pytest -q --junitxml=results.xml
+          python - <<'PY'
+          import xml.etree.ElementTree as ET
+          root = ET.parse("results.xml").getroot()
+          suites = [root] if root.tag == "testsuite" else root.findall("testsuite")
+          tests = sum(int(s.get("tests", 0)) for s in suites)
+          skipped = sum(int(s.get("skipped", 0)) for s in suites)
+          print(f"{tests} tests, {skipped} skipped")
+          assert tests > 0 and skipped == 0, "a skipped or empty test run is not a pass"
+          PY
+      - name: The package builds
+        run: |
+          python -m pip install build
+          python -m build
+
+  required:
+    name: CI required
+    needs: [python]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every job succeeded
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "job results: $RESULTS"
+          for result in $RESULTS; do
+            [ "$result" = "success" ] || { echo "a job ended as '$result' — not a pass"; exit 1; }
+          done
+          [ "$(echo "$RESULTS" | wc -w)" -eq 1 ] || { echo "expected one job result"; exit 1; }
