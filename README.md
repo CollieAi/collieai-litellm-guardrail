@@ -11,8 +11,8 @@ never changes or blocks a call, and never delays one beyond its own
 deadline. What CollieAi found goes into LiteLLM's guardrail log and
 CollieAi's audit. This release is a beta and only observes.
 
-You need a CollieAi project and its API key (`clai_…`). This beta runs
-only the project's dictionary rules: read
+You need a CollieAi project and its API key (`clai_…`). Rule support is
+decided by CollieAi's server execution profile, not by this adapter: read
 [Your project's policy](#your-projects-policy) before you start.
 
 - **Tested with:** LiteLLM proxy 1.102.4, Python ≥ 3.11. Use 1.102.2 or later:
@@ -80,32 +80,38 @@ start stops instead of running unobserved. Two cases stay LiteLLM's:
 
 ## Your project's policy
 
-This beta runs two of CollieAi's rule types: dictionary matching
-(`aho_corasick`) and `normalization`. Each phase runs the policy's rules for
-its direction: Input rules for pre-call, Output rules for post-call. If one
-of them is outside what the beta runs, the phase is refused as a whole. The
-call goes on unchanged, and the phase is a bypass `capability`. That
-happens with:
+With CollieAi's `stage1a-monitor-all-v1` server profile, the beta runs every
+message rule selected for the phase: Input rules for pre-call and Output
+rules for post-call. The adapter has no list of rule types. Rules still run
+only in Monitor, so a finding is reported but never changes the model request
+or response.
 
-- a rule of any other type: regex, structured IDs, URL rules, LLM
-  detection and so on;
+The server admits the complete selected policy before the first detector. If
+one configuration is unsafe for synchronous execution or needs input the
+adapter does not send, the phase is refused as a whole. The call goes on
+unchanged, and the phase is a bypass `capability`. Examples include:
+
+- an unbounded regex such as nested or variable repetition;
 - more than 16 rules for one direction, or more than 8 dictionary rules;
 - a dictionary rule on a dictionary group, a dictionary over 256 KiB, or a
   match mode other than `substring` with `whole_word` on;
-- a `normalization` rule with `trim_punctuation`.
+- a `normalization` rule with `trim_punctuation`;
+- inbound LLM conversation checking, because this adapter does not send a
+  complete CollieAi conversation context.
+
+Servers still using the rollback profiles `stage1a-narrow-v1` or
+`stage1a-wide-v1` accept only dictionary matching and normalization. The
+server's `profile` diagnostic tells you which profile answered.
 
 CollieAi's Logs show such a check with the error `capability:<what>`, for
 example `capability:rule_type`. The synthetic check at start meets the
 same refusal and logs `bypass:capability`.
 
-**Set the policy up before you connect the proxy.** A new CollieAi project
-starts with the Starter Monitor policy, which has rules of other types, so
-a new project alone still gives `bypass:capability`:
+**Set the policy up before you connect the proxy.** Confirm that every rule's
+configuration is admitted by the server profile:
 
-1. Give the guardrail's project a policy that holds only `aho_corasick`
-   rules and `normalization` rules without `trim_punctuation`, within the
-   limits above. Create one, or delete or disable every other Input and
-   Output rule in a policy no other project uses.
+1. Keep the policy within the limits above. On a rollback server, use only
+   `aho_corasick` and `normalization` without `trim_punctuation`.
 2. Send a test request through the proxy. The next summary must show
    `completed` for both phases. `bypass:capability` means a rule is still
    outside what the beta runs.

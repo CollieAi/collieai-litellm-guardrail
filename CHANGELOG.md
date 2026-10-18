@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Document server-side `stage1a-monitor-all-v1`: the unchanged 0.1.0 adapter
+  can monitor every message rule admitted by CollieAi's common execution and
+  input contract. Older server profiles remain limited to dictionary and
+  normalization rules.
+
 ## 0.1.0 — 2026-10-17
 
 First public release, beta.
