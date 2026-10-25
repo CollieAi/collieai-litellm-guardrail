@@ -3,7 +3,13 @@
 A 200 is a completed check only when every condition of the strict parse holds; anything else is the `protocol`
 bypass, with the first condition that failed as its detail. A block or a rewrite in Monitor is a protocol error, not
 a decision: the adapter never acts on a reply. A non-2xx is a bypass named by the contract's table from its status
-and `error.type`; without a JSON body or without `error.type` it is `http_<class>`.
+and `error.type`; without a JSON body or without `error.type` it is `http_<class>`. Its detail is the server's
+`error.code`, and the rule a refusal names goes with it (`error_detail`).
+
+A check found something when one of its findings is a `detection` — the server names each finding's `kind`: a
+rule of the policy found what it looks for. A rule's `allow` and a detector that did
+not run are no violation. The kind is all or nothing: a server before kinds names none, and then what Enforce would
+have done decides, as it did; some named and some not, or a word this adapter does not know, is not a check.
 
 The diagnostics kept from a check are built field by field from what the contract defines — identifiers, closed
 codes, counts, positions and timings — so nothing else a reply might carry reaches LiteLLM's logs.
@@ -12,6 +18,7 @@ codes, counts, positions and timings — so nothing else a reply might carry rea
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TypeGuard
@@ -32,6 +39,28 @@ COVERAGE_STATES = ("clean", "degraded")
 FLAGGED_OUTCOMES = ("transform", "block")
 #: The stages the server times; no other name is kept.
 TIMINGS = ("normalize", "pin", "check", "judge", "total")
+#: A finding's `kind`: what the rule found (`detection`), a rule's `allow`, or a detector that did not run.
+FINDING_KINDS = ("detection", "allow", "operational_failure")
+DETECTION = "detection"
+#: What `violation_categories` may name: CollieAi's rule types that check a message's text. A type outside it is
+#: OTHER_CATEGORY — a word of the adapter, never one of the server's. So a check names at most all of them and
+#: `other`, each at most 32 characters.
+CATEGORIES = frozenset(
+    {
+        "aho_corasick",
+        "base64_payload",
+        "language_detection",
+        "lightweight_model",
+        "llm_detection",
+        "normalization",
+        "qwen3guard_stream",
+        "regex",
+        "structured_id",
+        "url_filter",
+        "url_reputation",
+    }
+)
+OTHER_CATEGORY = "other"
 
 #: The server's error table for a Monitor reply: (status, error.type) → the bypass reason.
 ERROR_REASONS: dict[tuple[int, str], str] = {
@@ -78,18 +107,23 @@ BYPASS_REASONS = (
 )
 
 _SHORT = 256
+#: The forms of what an error's detail takes from the server: a closed code, and a rule's ID. Anything else is left out.
+_CODE = re.compile(r"[a-z][a-z0-9_]{0,63}")
+_RULE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 
 
 @dataclass(frozen=True)
 class Check:
-    """A completed Monitor check: the server judged every item of the phase. `flagged` — Enforce would have masked
-    or blocked: the call went on unchanged, but the check found something."""
+    """A completed Monitor check: the server judged every item of the phase. `flagged` — the check found something:
+    the call went on unchanged. `categories` — the rule types of what it found, for `violation_categories`: from
+    CATEGORIES or `other`, unique, sorted; none from a server before kinds, which does not say what a finding is."""
 
     evaluation_id: str
     coverage_state: str
     would_outcome: str | None
     flagged: bool
     diagnostics: dict[str, object]
+    categories: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -134,17 +168,29 @@ def parse_check(body: bytes, *, phase: str) -> Check | Rejected:
     evaluation_id = collieai.get("evaluation_id")
     if not isinstance(evaluation_id, str) or not evaluation_id or len(evaluation_id) > _SHORT:
         return Rejected("evaluation_id")
+    findings = _findings(collieai.get("items"))
+    named = ["kind" in finding for finding in findings]
+    if any(named) and not (all(named) and all(finding["kind"] in FINDING_KINDS for finding in findings)):
+        return Rejected("finding_kind")
     diagnostics = _diagnostics(collieai)
     kept_would = diagnostics.get("would")
     would: dict[str, object] = kept_would if isinstance(kept_would, dict) else {}
     kept_outcome = would.get("outcome")
     outcome = kept_outcome if isinstance(kept_outcome, str) else None
+    if findings and not any(named):  # a server before kinds: what Enforce would have done
+        flagged = outcome in FLAGGED_OUTCOMES or would.get("would_block") is True or would.get("would_mask") is True
+        categories: tuple[str, ...] = ()
+    else:
+        detections = [finding for finding in findings if finding["kind"] == DETECTION]
+        flagged = bool(detections)
+        categories = tuple(sorted({_category(finding.get("rule_type")) for finding in detections}))
     return Check(
         evaluation_id=evaluation_id,
         coverage_state=str(coverage["state"]),
         would_outcome=outcome,
-        flagged=outcome in FLAGGED_OUTCOMES or would.get("would_block") is True or would.get("would_mask") is True,
+        flagged=flagged,
         diagnostics=diagnostics,
+        categories=categories,
     )
 
 
@@ -152,20 +198,50 @@ def error_reason(status: int, body: bytes) -> str:
     """The bypass reason of a reply that is not a 2xx."""
     if status == RATE_LIMITED_STATUS:
         return "rate_limited"
-    error_type = _error_type(body)
-    if error_type is not None and (status, error_type) in ERROR_REASONS:
+    error_type = _error(_object(body)).get("type")
+    if isinstance(error_type, str) and (status, error_type) in ERROR_REASONS:
         return ERROR_REASONS[(status, error_type)]
     return f"http_{status // 100}xx" if 100 <= status < 600 else "protocol"
 
 
-def _error_type(body: bytes) -> str | None:
+def error_detail(body: bytes) -> tuple[str | None, str | None]:
+    """What a reply that is not a 2xx says of itself: its `error.code` — why, e.g. `aho_source` of a `capability`
+    refusal — and the rule its refusal names (`collieai.refusal.rule_id`), each only in its form, else None."""
+    reply = _object(body)
+    code = _error(reply).get("code")
+    collieai = reply.get("collieai")
+    refusal = collieai.get("refusal") if isinstance(collieai, Mapping) else None
+    rule_id = refusal.get("rule_id") if isinstance(refusal, Mapping) else None
+    return (
+        code if isinstance(code, str) and _CODE.fullmatch(code) else None,
+        rule_id if isinstance(rule_id, str) and _RULE_ID.fullmatch(rule_id) else None,
+    )
+
+
+def _object(body: bytes) -> Mapping[str, object]:
     try:
         reply = json.loads(body)
     except (ValueError, UnicodeDecodeError):
-        return None
-    error = reply.get("error") if isinstance(reply, dict) else None
-    error_type = error.get("type") if isinstance(error, dict) else None
-    return error_type if isinstance(error_type, str) else None
+        return {}
+    return reply if isinstance(reply, dict) else {}
+
+
+def _error(reply: Mapping[str, object]) -> Mapping[str, object]:
+    error = reply.get("error")
+    return error if isinstance(error, dict) else {}
+
+
+def _findings(items: object) -> list[Mapping[str, object]]:
+    """Every finding of the reply's items, as the diagnostics keep them: what is not an object is passed over."""
+    found: list[Mapping[str, object]] = []
+    for item in items if isinstance(items, list) else []:
+        findings = item.get("findings") if isinstance(item, Mapping) else None
+        found.extend(f for f in (findings if isinstance(findings, list) else []) if isinstance(f, Mapping))
+    return found
+
+
+def _category(rule_type: object) -> str:
+    return rule_type if isinstance(rule_type, str) and rule_type in CATEGORIES else OTHER_CATEGORY
 
 
 def _is_int(value: object) -> TypeGuard[int]:
@@ -183,13 +259,25 @@ def _diagnostics(collieai: Mapping[str, object]) -> dict[str, object]:
             out[key] = value
     coverage = collieai.get("coverage")
     if isinstance(coverage, Mapping):
-        out["coverage"] = {
+        kept: dict[str, object] = {
             "state": coverage.get("state"),
             "items_judged": coverage.get("items_judged"),
             "items_total": coverage.get("items_total"),
             "rules_run": _ints(coverage.get("rules_run")),
             "degraded_rules": _strs(coverage.get("degraded_rules")),
         }
+        if "not_applicable" in coverage:  # a server of profile v2 lists the rules that did not apply, and why
+            entries = coverage.get("not_applicable")
+            kept["not_applicable"] = [
+                {
+                    "item": entry.get("item") if _is_int(entry.get("item")) else None,
+                    "rule_id": _str_or_none(entry.get("rule_id")),
+                    "reason": _str_or_none(entry.get("reason")),
+                }
+                for entry in (entries if isinstance(entries, list) else [])
+                if isinstance(entry, Mapping)
+            ]
+        out["coverage"] = kept
     would = collieai.get("would")
     if isinstance(would, Mapping):
         out["would"] = {
@@ -220,7 +308,7 @@ def _item(item: Mapping[str, object]) -> dict[str, object]:
         "source": _str_or_none(item.get("source")),
         "outcome": _str_or_none(item.get("outcome")),
         "findings": [
-            {key: _str_or_none(finding.get(key)) for key in ("rule_id", "rule_type", "action", "mode")}
+            {key: _str_or_none(finding.get(key)) for key in ("rule_id", "rule_type", "action", "mode", "kind")}
             for finding in (findings if isinstance(findings, list) else [])
             if isinstance(finding, Mapping)
         ],

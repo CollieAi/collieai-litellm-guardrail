@@ -1,7 +1,8 @@
 """The worker's own evidence that the adapter is wired and the server answers.
 
-- **Summary.** Every `summary_interval_s` one INFO line, `collieai guardrail summary {json}`, with each phase's
-  counts over the interval: hooks, eligible, attempted, completed, bypass and outside by reason, and what LiteLLM's
+- **Summary.** Every `summary_interval_s` one INFO line, `collieai guardrail summary {json}`, with the guardrail's
+  name in LiteLLM (`guardrail`: a proxy may have more than one CollieAi guardrail) and each phase's counts over the
+  interval: hooks, eligible, attempted, completed, bypass and outside by reason, and what LiteLLM's
   log events counted apart from the hooks. Derived: `coverage` — of the checks that ended in the interval, the
   share that completed, `completed / (completed + bypass)`; a check started in one interval may end in the next,
   so it is not taken of `eligible`, which counts starts. `outside_share` — calls outside the supported profile of all
@@ -17,8 +18,9 @@
   Both completed: INFO. Answered `busy` and nothing worse: INFO, and the check is repeated soon, up to
   SYNTHETIC_BUSY_RETRIES times. Otherwise, or busy every time: a WARNING with each phase's result and reason.
 
-Counts, codes and results only: no text, no key, no identifier. The loop survives its own errors; cancelling the task
-stops it, and so does the owner's retiring: the loop asks at each turn, and a retired owner's loop ends for good.
+Counts, codes, results and the guardrail's name only: no text, no key, no identifier of a call. The loop survives its
+own errors; cancelling the task stops it, and so does the owner's retiring: the loop asks at each turn, and a retired
+owner's loop ends for good.
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ import random
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
 
+from collieai_guardrail.config import named
 from collieai_guardrail.counters import PHASES, Counters
 from collieai_guardrail.observer import POST_CALL, PRE_CALL, Observer, Outcome
 from collieai_guardrail.payload import CallFacts
@@ -126,10 +129,14 @@ class Heartbeat:
         retired: Callable[[], bool] | None = None,
         on_retired: Callable[[], Awaitable[None]] | None = None,
         start_spread_s: float | None = None,
+        name: str | None = None,
     ):
         """`retired` — asked at each turn of the loop: the owner is gone and the loop should end; then
         `on_retired` releases what the owner holds. `start_spread_s` — the first synthetic check waits a random part
-        of it; by default SYNTHETIC_START_SPREAD_S, at most a tenth of the interval."""
+        of it; by default SYNTHETIC_START_SPREAD_S, at most a tenth of the interval. `name` — the guardrail's name in
+        LiteLLM, in each line."""
+        self._name = name
+        self._named = named(name)
         self._observer = observer
         self._counters = counters
         self._summary_interval_s = summary_interval_s
@@ -199,13 +206,16 @@ class Heartbeat:
         try:
             gone = self._retired is not None and self._retired()
         except Exception as error:  # an owner that cannot say is kept: a stopped heartbeat would hide it
-            logger.warning("collieai guardrail: checking the registration failed (%s)", type(error).__name__)
+            logger.warning(
+                "collieai guardrail: checking the registration failed (%s)%s", type(error).__name__, self._named
+            )
             return False
         if gone:
             self._ended = True
             logger.info(
                 "collieai guardrail: LiteLLM no longer has this instance among its callbacks (the guardrail was"
-                " removed or rebuilt); its summary and synthetic check stop"
+                " removed or rebuilt); its summary and synthetic check stop%s",
+                self._named,
             )
         return gone
 
@@ -215,29 +225,35 @@ class Heartbeat:
         try:
             pre, post = await synthetic_check(self._observer)
         except Exception as error:  # the loop outlives its own faults
-            logger.warning("collieai guardrail synthetic check failed inside the adapter (%s)", type(error).__name__)
+            logger.warning(
+                "collieai guardrail synthetic check failed inside the adapter (%s)%s", type(error).__name__, self._named
+            )
             self._synthetic = {PRE_CALL: "error", POST_CALL: "error"}
             return None
         self._synthetic = {PRE_CALL: describe(pre), POST_CALL: describe(post)}
         if pre.result == post.result == "completed":
-            logger.info("collieai guardrail synthetic check: pre_call completed, post_call completed")
+            logger.info("collieai guardrail synthetic check: pre_call completed, post_call completed%s", self._named)
         elif retry_if_busy and only_busy((pre, post)):
             logger.info(
                 "collieai guardrail synthetic check: pre_call %s, post_call %s; CollieAi had no free slot, the check is"
-                " repeated in a few seconds",
+                " repeated in a few seconds%s",
                 describe(pre),
                 describe(post),
+                self._named,
             )
         else:
             logger.warning(
-                "collieai guardrail synthetic check: pre_call %s (detail=%s, http_status=%s), post_call %s (detail=%s,"
-                " http_status=%s); the calls' observations are likely failing the same way",
+                "collieai guardrail synthetic check: pre_call %s (detail=%s, http_status=%s, rule_id=%s), post_call %s"
+                " (detail=%s, http_status=%s, rule_id=%s); the calls' observations are likely failing the same way%s",
                 describe(pre),
                 pre.detail,
                 pre.http_status,
+                pre.rule_id,
                 describe(post),
                 post.detail,
                 post.http_status,
+                post.rule_id,
+                self._named,
             )
         return pre, post
 
@@ -247,6 +263,7 @@ class Heartbeat:
             counts = interval_counts(self._last, now)
             self._last = now
             summary: dict[str, object] = {
+                "guardrail": self._name,
                 "interval_s": self._summary_interval_s,
                 **counts,
                 "synthetic": dict(self._synthetic),
@@ -255,13 +272,16 @@ class Heartbeat:
             for phase in unwired_phases(counts, now):
                 logger.warning(
                     "collieai guardrail %s: LiteLLM logged %d eligible calls and the hook has never run; the guardrail"
-                    " is not wired for this phase (mode, default_on or the request's guardrails)",
+                    " is not wired for this phase (mode, default_on or the request's guardrails)%s",
                     phase,
                     _int(counts[phase].get("logged_eligible")),
+                    self._named,
                 )
             return summary
         except Exception as error:
-            logger.warning("collieai guardrail summary failed inside the adapter (%s)", type(error).__name__)
+            logger.warning(
+                "collieai guardrail summary failed inside the adapter (%s)%s", type(error).__name__, self._named
+            )
             return None
 
 

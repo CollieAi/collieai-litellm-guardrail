@@ -37,6 +37,7 @@ from litellm_contract import (  # noqa: E402
     chat_request,
     check_reply,
     json_reply,
+    legacy_reply,
     never_answers,
 )
 
@@ -207,6 +208,7 @@ async def test_a_mode_of_its_own_hooks_loads_and_warns_of_a_phase_it_leaves_out(
     warned = [r.getMessage() for r in caplog.records if "mode has no" in r.getMessage()]
     expected = (
         f"collieai guardrail: mode has no {unobserved}; that phase is not observed (set mode: [pre_call, post_call])"
+        " (guardrail collieai-monitor)"
     )
     assert warned == ([] if unobserved is None else [expected])
 
@@ -433,6 +435,8 @@ async def test_a_mode_without_post_call_or_with_default_off_warns(
     assert any("mode has no post_call" in m for m in messages)
     assert any("default_on is false" in m for m in messages)
     assert not any("mode has no pre_call" in m for m in messages)
+    # two such guardrails in one proxy would otherwise warn alike
+    assert messages and all(m.endswith(" (guardrail collieai-monitor)") for m in messages)
 
 
 # ------------------------------------------------------------------ the hooks
@@ -490,6 +494,71 @@ async def test_post_call_checks_litellms_response_under_the_same_operation_id(bu
         (GuardrailEventHooks.post_call, "guardrail_flagged"),
     ]
     assert guardrail.counters.snapshot()["post_call"]["completed"] == 1
+
+
+async def test_a_checks_action_and_what_it_found_are_fields_of_litellms_record(build: Build) -> None:
+    """Through LiteLLM's own `add_standard_logging_guardrail_information_to_request_data`:
+    `guardrail_action` and `violation_categories` go in by its `tracing_detail`, beside the guardrail's response."""
+    guardrail = build(_server())
+    data = _proxy_data()
+    await guardrail.async_pre_call_hook(user_api_key_dict=_user(), cache=None, data=data, call_type="acompletion")
+    [record] = _records(data)
+    assert (record["guardrail_status"], record["guardrail_action"], record["violation_categories"]) == (
+        "guardrail_flagged",
+        "NONE",
+        ["aho_corasick"],
+    )
+    [finding] = record["guardrail_response"]["collieai"]["items"][0]["findings"]
+    assert finding["kind"] == "detection"
+
+
+@pytest.mark.parametrize(
+    ("reply", "status", "categories"),
+    [
+        (check_reply(found=False), "success", None),
+        (legacy_reply(), "guardrail_flagged", None),  # a server before kinds does not say what a finding is
+    ],
+)
+async def test_a_check_that_names_no_detection_gives_litellm_no_category(
+    build: Build, reply: dict[str, Any], status: str, categories: list[str] | None
+) -> None:
+    guardrail = build(MockServer(json_reply(200, reply)))
+    data = _proxy_data()
+    await guardrail.async_pre_call_hook(user_api_key_dict=_user(), cache=None, data=data, call_type="acompletion")
+    [record] = _records(data)
+    assert (record["guardrail_status"], record["guardrail_action"], record["violation_categories"]) == (
+        status,
+        "NONE",
+        categories,
+    )
+
+
+async def test_a_refusal_gives_litellm_its_code_and_rule_and_no_action(build: Build) -> None:
+    """What the proxy's record says of a refusal; no check was made, so no action and no category."""
+    refused = {
+        "error": {
+            "message": "Policy is outside the supported execution profile",
+            "type": "capability",
+            "code": "aho_source",
+        },
+        "collieai": {"version": 1, "terminal": "refused", "refusal": {"kind": "capability", "rule_id": "6f1c-rule"}},
+    }
+    guardrail = build(MockServer(json_reply(422, refused)))
+    data = _proxy_data()
+    await guardrail.async_pre_call_hook(user_api_key_dict=_user(), cache=None, data=data, call_type="acompletion")
+    [record] = _records(data)
+    assert record["guardrail_status"] == "guardrail_failed_to_respond"
+    assert record.get("guardrail_action") is None and record.get("violation_categories") is None
+    response = record["guardrail_response"]
+    assert (response["reason"], response["detail"], response["rule_id"]) == ("capability", "aho_source", "6f1c-rule")
+
+
+async def test_the_guardrails_name_in_litellm_is_in_its_summary_and_warnings(build: Build) -> None:
+    """Two CollieAi guardrails in one proxy tell their lines apart."""
+    guardrail = build(_server())
+    summary = guardrail.heartbeat.summarize()
+    assert summary is not None and summary["guardrail"] == "collieai-monitor"
+    assert guardrail.observer.name == "collieai-monitor"
 
 
 async def test_pre_call_starts_a_new_logical_call_whatever_the_request_claims(build: Build) -> None:
@@ -609,8 +678,8 @@ async def test_a_fault_of_the_glue_is_logged_and_the_call_goes_on(
     )
     messages = [r.getMessage() for r in caplog.records]
     assert messages == [
-        "collieai guardrail pre_call: the glue failed (RuntimeError); the call goes on",
-        "collieai guardrail post_call: the glue failed (RuntimeError); the call goes on",
+        "collieai guardrail pre_call: the glue failed (RuntimeError); the call goes on (guardrail collieai-monitor)",
+        "collieai guardrail post_call: the glue failed (RuntimeError); the call goes on (guardrail collieai-monitor)",
     ]
 
 

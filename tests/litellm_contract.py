@@ -83,12 +83,29 @@ def check_reply(phase: str = "pre_call", items: int = 3, *, found: bool = True) 
                     "index": 2,
                     "source": "structured_messages[2].content",
                     "outcome": "transform",
-                    "findings": [{"rule_id": "7d1e", "rule_type": "aho_corasick", "action": "mask", "mode": "monitor"}],
+                    "findings": [
+                        {
+                            "rule_id": "7d1e",
+                            "rule_type": "aho_corasick",
+                            "action": "mask",
+                            "mode": "monitor",
+                            "kind": "detection",
+                        }
+                    ],
                 }
             ],
             "timings_ms": {"normalize": 0.4, "pin": 6.1, "check": 0.2, "judge": 41.0, "total": 48.3},
         },
     }
+
+
+def legacy_reply(phase: str = "pre_call", items: int = 3) -> dict[str, Any]:
+    """The example as a server before finding kinds (2026.10.23) serializes it: no finding names its `kind`."""
+    reply = check_reply(phase, items)
+    for item in reply["collieai"].get("items", []):
+        for finding in item["findings"]:
+            del finding["kind"]
+    return reply
 
 
 def error_body(error_type: str, code: str | None = None) -> dict[str, Any]:
