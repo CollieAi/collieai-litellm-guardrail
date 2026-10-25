@@ -186,6 +186,30 @@ async def test_a_call_the_proxy_refused_is_counted_outside_not_as_a_hook_that_di
     assert pre["logged_unseen"] == 0 and unwired_phases(counts, now) == []
 
 
+# ------------------------------------------------------------------ what LiteLLM's spend logs keep
+
+
+async def test_where_litellms_spend_log_redacts_the_response_it_keeps_the_action_and_the_categories(
+    load: Load,
+) -> None:
+    """With LiteLLM's default (`store_prompts_in_spend_logs: false`) the spend log replaces the
+    guardrail's response; what the check found stays in the fields it keeps."""
+    from litellm.proxy.spend_tracking.spend_tracking_utils import _sanitize_guardrail_information_for_spend_logs
+
+    guardrail = load(_server())
+    data = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "hello"}], "metadata": {}}
+    await guardrail.async_pre_call_hook(
+        user_api_key_dict=UserAPIKeyAuth(request_route=ROUTE), cache=None, data=data, call_type="acompletion"
+    )
+    [kept] = _sanitize_guardrail_information_for_spend_logs(data["metadata"]["standard_logging_guardrail_information"])
+    assert kept["guardrail_response"] == "REDACTED_BY_LITELM"
+    assert (kept["guardrail_status"], kept["guardrail_action"], kept["violation_categories"]) == (
+        "guardrail_flagged",
+        "NONE",
+        ["aho_corasick"],
+    )
+
+
 # ------------------------------------------------------------------ a deleted guardrail
 
 

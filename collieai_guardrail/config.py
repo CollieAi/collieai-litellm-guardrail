@@ -36,6 +36,11 @@ DEFAULT_SYNTHETIC_INTERVAL_S = 300
 #: adapter as None from the proxy's config, or as the string "None" from LiteLLM's guardrail registry, which resolves
 #: the variable itself for a guardrail added through its API; a key without the prefix is taken for a missing one.
 KEY_PREFIX = "clai_"
+#: The variable the documented config reads the key from, and what LiteLLM hands over when it is unset.
+KEY_VARIABLE = "COLLIEAI_API_KEY"
+UNSET_KEY_VALUES = (None, "", "None")
+#: The longest guardrail name the adapter repeats in its log.
+MAX_NAME_CHARS = 128
 
 
 class ConfigError(Exception):
@@ -75,7 +80,14 @@ class AdapterConfig:
             raise ConfigError("api_base must use https; http only for a loopback address (127.0.0.1, ::1, localhost)")
         if parts.username is not None or parts.password is not None or parts.query or parts.fragment:
             raise ConfigError("api_base must not carry credentials, a query or a fragment")
-        if not isinstance(self.api_key, str) or not self.api_key or self.api_key != self.api_key.strip():
+        if self.api_key in UNSET_KEY_VALUES:
+            # LiteLLM resolves `os.environ/<NAME>` of an unset variable to None, "" or "None" depending on the path;
+            # the adapter never sees the name, so it names the one the documented config reads.
+            raise ConfigError(
+                f"api_key is not set; the documented config reads it from {KEY_VARIABLE}"
+                f" (api_key: os.environ/{KEY_VARIABLE}): is {KEY_VARIABLE} set in the proxy's environment?"
+            )
+        if not isinstance(self.api_key, str) or self.api_key != self.api_key.strip():
             raise ConfigError("api_key must be a non-empty string without surrounding whitespace")
         if any(ch in self.api_key for ch in "\r\n\x00"):
             raise ConfigError("api_key must be one line")
@@ -97,6 +109,20 @@ class AdapterConfig:
     def budget_ms(self) -> int:
         """The server's share of the deadline: what remains after the network's margin, at least 1 ms."""
         return self.deadline_ms - self.network_margin_ms
+
+
+def guardrail_name(value: object) -> str | None:
+    """The guardrail's name in LiteLLM (`guardrail_name`) as the adapter's log repeats it, so that the lines of two
+    CollieAi guardrails in one proxy tell apart: one printable line of at most MAX_NAME_CHARS, else None."""
+    if isinstance(value, str) and 0 < len(value) <= MAX_NAME_CHARS and value.isprintable():
+        return value
+    return None
+
+
+def named(name: str | None) -> str:
+    """The end of each line an instance logs, the summary aside (its JSON has the name): ` (guardrail <name>)`, or
+    nothing for an instance without a name."""
+    return "" if name is None else f" (guardrail {name})"
 
 
 def _is_loopback(host: str) -> bool:

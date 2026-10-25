@@ -4,17 +4,19 @@ the same functions against LiteLLM's real objects are in `test_litellm_adapter_g
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import enum
 import json
 import logging
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 import collieai_guardrail.heartbeat as heartbeat_module
-from collieai_guardrail.config import AdapterConfig, ConfigError
+from collieai_guardrail.config import AdapterConfig, ConfigError, guardrail_name
 from collieai_guardrail.counters import Counters
 from collieai_guardrail.heartbeat import (
     SYNTHETIC_BUSY_RETRIES,
@@ -266,11 +268,26 @@ def test_the_heartbeat_settings_are_checked(change: dict[str, Any]) -> None:
         AdapterConfig(api_base=API_BASE, api_key=API_KEY, **change)
 
 
-@pytest.mark.parametrize("api_key", ["None", "sk-0123456789abcdef", "clai_"])
+@pytest.mark.parametrize("api_key", ["sk-0123456789abcdef", "clai_"])
 def test_a_key_that_is_not_a_collieai_project_key_is_refused(api_key: str) -> None:
-    """LiteLLM's registry resolves `os.environ/COLLIEAI_API_KEY` of an unset variable to the string "None"."""
-    with pytest.raises(ConfigError, match="api_key"):
+    with pytest.raises(ConfigError, match="api_key") as refused:
         AdapterConfig(api_base=API_BASE, api_key=api_key)
+    assert api_key == "clai_" or api_key not in str(refused.value)  # the message names the prefix itself
+
+
+@pytest.mark.parametrize("api_key", [None, "", "None"])
+def test_an_unset_key_names_the_variable_to_set(api_key: Any) -> None:
+    """LiteLLM resolves `os.environ/COLLIEAI_API_KEY` of an unset variable to None (the proxy's start, LiteLLM
+    1.102.4 image), "" or the string "None" (its registry); each says which variable to set."""
+    with pytest.raises(ConfigError, match=r"api_key is not set.*COLLIEAI_API_KEY"):
+        AdapterConfig(api_base=API_BASE, api_key=api_key)
+
+
+@pytest.mark.parametrize("api_key", [" clai_0123456789", "clai_0123456789 "])
+def test_a_key_with_surrounding_whitespace_is_refused_without_its_value(api_key: str) -> None:
+    with pytest.raises(ConfigError, match="surrounding whitespace") as refused:
+        AdapterConfig(api_base=API_BASE, api_key=api_key)
+    assert api_key.strip() not in str(refused.value)
 
 
 def test_a_setting_error_is_not_one_litellms_loader_swallows() -> None:
@@ -379,6 +396,62 @@ async def test_the_summary_line_is_json_of_counts_only_and_warns_about_an_unwire
     assert not [r for r in caplog.records if r.levelno == logging.WARNING]
 
 
+def test_each_guardrails_summary_names_it(caplog: pytest.LogCaptureFixture) -> None:
+    """With two CollieAi guardrails in one proxy, each summary says whose counts it has."""
+    caplog.set_level(logging.INFO, logger="collieai_guardrail")
+    for name in ("collieai-team-a", "collieai-team-b", None):
+        observer = _observer(MockServer(json_reply(200, check_reply())))
+        Heartbeat(observer, Counters(), summary_interval_s=60, synthetic_interval_s=0, name=name).summarize()
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("collieai guardrail summary ")]
+    names = [json.loads(line.removeprefix("collieai guardrail summary "))["guardrail"] for line in lines]
+    assert names == ["collieai-team-a", "collieai-team-b", None]
+
+
+def test_every_line_an_instance_logs_ends_with_its_guardrails_name() -> None:
+    """Each WARNING and INFO of the glue, the heartbeat and the observer passes the name's tail as
+    its last argument, the summary aside, whose JSON carries the name. A line added without it fails here."""
+    package = Path(__file__).resolve().parent.parent / "collieai_guardrail"
+    lines = 0
+    for module in ("guardrail.py", "heartbeat.py", "observer.py"):
+        for node in ast.walk(ast.parse((package / module).read_text())):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in ("warning", "info", "error")
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "logger"
+            ):
+                continue
+            text = node.args[0]
+            assert isinstance(text, ast.Constant) and isinstance(text.value, str)
+            if text.value == "collieai guardrail summary %s":
+                continue
+            last = node.args[-1]
+            lines += 1
+            assert text.value.endswith("%s") and isinstance(last, ast.Attribute) and last.attr == "_named", (
+                f"{module}:{node.lineno}"
+            )
+    assert lines == 14
+
+
+@pytest.mark.parametrize(
+    ("value", "name"),
+    [
+        ("collieai-monitor", "collieai-monitor"),
+        ("CollieAi monitor · team A", "CollieAi monitor · team A"),
+        ("n" * 128, "n" * 128),
+        ("n" * 129, None),
+        ("two\nlines", None),
+        ("tab\there", None),
+        ("", None),
+        (None, None),
+        (7, None),
+    ],
+)
+def test_the_name_the_log_repeats_is_one_printable_line(value: Any, name: str | None) -> None:
+    assert guardrail_name(value) == name
+
+
 # ------------------------------------------------------------------ the synthetic check
 
 
@@ -412,6 +485,33 @@ async def test_a_failing_synthetic_check_warns_with_each_phases_reason(caplog: p
     assert summary is not None and summary["synthetic"] == {"pre_call": "bypass:auth", "post_call": "bypass:auth"}
 
 
+async def test_a_synthetic_check_refused_for_a_rule_names_the_code_and_the_rule(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Before, the WARNING said `capability` and `detail=None`; which rule and why were only in CollieAi."""
+    caplog.set_level(logging.INFO, logger="collieai_guardrail")
+    refused = {
+        "error": {
+            "message": "Policy is outside the supported execution profile",
+            "type": "capability",
+            "code": "aho_source",
+        },
+        "collieai": {"version": 1, "terminal": "refused", "refusal": {"kind": "capability", "rule_id": "6f1c-rule"}},
+    }
+    heartbeat = Heartbeat(
+        _observer(MockServer(json_reply(422, refused))),
+        Counters(),
+        summary_interval_s=60,
+        synthetic_interval_s=300,
+        name="collieai-monitor",
+    )
+    await asyncio.wait_for(heartbeat.run_synthetic(), timeout=5)
+    [warning] = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert "pre_call bypass:capability (detail=aho_source, http_status=422, rule_id=6f1c-rule)" in warning
+    assert "post_call bypass:capability (detail=aho_source, http_status=422, rule_id=6f1c-rule)" in warning
+    assert warning.endswith("(guardrail collieai-monitor)")
+
+
 async def test_a_synthetic_check_that_fails_only_post_call_warns_too(caplog: pytest.LogCaptureFixture) -> None:
     caplog.set_level(logging.INFO, logger="collieai_guardrail")
     replies = iter([json_reply(200, check_reply("pre_call", items=1)), json_reply(503, {"error": {}})])
@@ -435,10 +535,11 @@ async def test_a_passing_synthetic_check_logs_at_info(caplog: pytest.LogCaptureF
         Counters(),
         summary_interval_s=60,
         synthetic_interval_s=300,
+        name="collieai-monitor",
     )
     await asyncio.wait_for(heartbeat.run_synthetic(), timeout=5)
     assert [r.getMessage() for r in caplog.records if r.name == "collieai_guardrail"] == [
-        "collieai guardrail synthetic check: pre_call completed, post_call completed"
+        "collieai guardrail synthetic check: pre_call completed, post_call completed (guardrail collieai-monitor)"
     ]
 
 
@@ -529,7 +630,7 @@ async def test_a_synthetic_check_answered_busy_is_repeated_before_it_warns(caplo
     await _until_warned(caplog, heartbeat)
     lines = [(r.levelname, r.getMessage().split(";")[0]) for r in caplog.records if "synthetic check" in r.getMessage()]
     busy = ("INFO", "collieai guardrail synthetic check: pre_call bypass:busy, post_call completed")
-    passed = ("INFO", "collieai guardrail synthetic check: pre_call completed, post_call completed")
+    passed = ("INFO", "collieai guardrail synthetic check: pre_call completed, post_call completed")  # no name
     assert lines[:-1] == [busy, passed, *[busy] * SYNTHETIC_BUSY_RETRIES]
     assert lines[-1][0] == "WARNING" and "pre_call bypass:busy" in lines[-1][1]
     assert len(server.requests) == 2 * len(lines)

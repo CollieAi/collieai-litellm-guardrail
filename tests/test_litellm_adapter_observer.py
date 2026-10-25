@@ -34,6 +34,7 @@ from litellm_contract import (
     chat_response,
     check_reply,
     json_reply,
+    legacy_reply,
     never_answers,
     raw_reply,
     refuses_connection,
@@ -170,6 +171,101 @@ def test_the_diagnostics_keep_would_effective_and_degraded_apart() -> None:
     assert Outcome("pre_call", "outside", reason="streaming").guardrail_status == "not_run"
 
 
+def _check(reply: dict[str, Any], *, kinds: list[str] | None = None, state: str = "clean") -> Check:
+    """`reply` with its one finding's kind as each of `kinds`, and its coverage in `state`."""
+    if kinds is not None:
+        [finding] = reply["collieai"]["items"][0]["findings"]
+        reply["collieai"]["items"][0]["findings"] = [{**finding, "kind": kind} for kind in kinds]
+    reply["collieai"]["coverage"]["state"] = state
+    check = parse_check(json.dumps(reply).encode(), phase="pre_call")
+    assert isinstance(check, Check)
+    return check
+
+
+@pytest.mark.parametrize(
+    ("reply", "kinds", "state", "status", "categories"),
+    [
+        # what the check found comes first: a partial result that found something is flagged
+        (check_reply(), ["detection"], "clean", "guardrail_flagged", ["aho_corasick"]),
+        (check_reply(), ["detection"], "degraded", "guardrail_flagged", ["aho_corasick"]),
+        (check_reply(), ["allow", "detection"], "degraded", "guardrail_flagged", ["aho_corasick"]),
+        # found nothing where a rule did not run: no full answer
+        (check_reply(), ["operational_failure"], "degraded", "guardrail_failed_to_respond", None),
+        (check_reply(found=False), None, "degraded", "guardrail_failed_to_respond", None),
+        (check_reply(), ["allow"], "clean", "success", None),
+        (check_reply(), ["operational_failure"], "clean", "success", None),
+        (check_reply(found=False), None, "clean", "success", None),
+        # a server before kinds: what Enforce would have done (the example would mask)
+        (legacy_reply(), None, "clean", "guardrail_flagged", None),
+        (legacy_reply(), None, "degraded", "guardrail_flagged", None),
+    ],
+)
+def test_a_completed_checks_status_and_what_litellm_keeps_of_it(
+    reply: dict[str, Any], kinds: list[str] | None, state: str, status: str, categories: list[str] | None
+) -> None:
+    """The phase's status, and the two fields of LiteLLM's record its logs never redact."""
+    outcome = Outcome("pre_call", "completed", check=_check(reply, kinds=kinds, state=state), http_status=200)
+    assert (outcome.guardrail_status, outcome.violation_categories, outcome.guardrail_action) == (
+        status,
+        categories,
+        "NONE",  # the route's action, never what Enforce would have done
+    )
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [Outcome("pre_call", "bypass", reason="capability", detail="aho_source"), Outcome("post_call", "outside", "n")],
+)
+def test_where_no_check_was_made_litellm_gets_no_action_and_no_category(outcome: Outcome) -> None:
+    assert (outcome.guardrail_action, outcome.violation_categories) == (None, None)
+
+
+async def test_a_refusal_names_its_code_and_its_rule_in_the_outcome_the_record_and_the_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A refusal: the proxy's log says which rule and why, not only `capability`."""
+    caplog.set_level(logging.WARNING, logger="collieai_guardrail")
+    refused = {
+        "error": {
+            "message": "Policy is outside the supported execution profile",
+            "type": "capability",
+            "code": "aho_source",
+        },
+        "collieai": {
+            "version": 1,
+            "evaluation_id": "e-1",
+            "phase": "pre_call",
+            "terminal": "refused",
+            "refusal": {
+                "kind": "capability",
+                "reason": "aho_source",
+                "path": None,
+                "rule_id": "6f1c0000-rule",
+                "item": None,
+                "observed": None,
+                "cap": None,
+            },
+        },
+    }
+    observer = Observer(
+        AdapterConfig(api_base=API_BASE, api_key=API_KEY, deadline_ms=DEADLINE_MS, network_margin_ms=100),
+        client=MockServer(json_reply(422, refused)).client(),
+        name="collieai-monitor",
+    )
+    outcome = await _pre(observer)
+    assert (outcome.reason, outcome.detail, outcome.rule_id, outcome.http_status) == (
+        "capability",
+        "aho_source",
+        "6f1c0000-rule",
+        422,
+    )
+    diagnostics = outcome.diagnostics()
+    assert (diagnostics["detail"], diagnostics["rule_id"]) == ("aho_source", "6f1c0000-rule")
+    [warning] = [r.getMessage() for r in caplog.records]
+    assert "(capability, detail=aho_source, http_status=422, rule_id=6f1c0000-rule)" in warning
+    assert warning.endswith("(0 more held back since the last warning) (guardrail collieai-monitor)")
+
+
 # ------------------------------------------------------------------ bypass by reason, one POST each
 
 
@@ -181,6 +277,7 @@ async def test_each_error_of_the_table_is_a_bypass_with_its_reason_after_one_pos
     observer = _observer(server)
     outcome = await _pre(observer)
     assert (outcome.result, outcome.reason, outcome.http_status) == ("bypass", reason, status)
+    assert (outcome.detail, outcome.rule_id) == (body["error"].get("code"), None)
     assert len(server.requests) == 1
     assert observer.counters.snapshot()["pre_call"]["bypass"] == {reason: 1}
 

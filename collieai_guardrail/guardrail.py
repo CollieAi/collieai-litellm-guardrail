@@ -7,7 +7,9 @@ adds it to its callbacks. It defines no `apply_guardrail`, so the proxy calls it
 - `async_pre_call_hook` and `async_post_call_success_hook` observe the phase through the core (`observer`) and
   return None — LiteLLM keeps the request and the response as they are. What happened goes into LiteLLM's standard
   guardrail log (`StandardLoggingGuardrailInformation`) with its status: `success`, `guardrail_flagged`,
-  `guardrail_failed_to_respond` or `not_run`.
+  `guardrail_failed_to_respond` or `not_run`; a completed check also with `guardrail_action` and
+  `violation_categories`, through LiteLLM's `tracing_detail` — the fields its logs keep where they redact the
+  guardrail's response.
 - Pre-call gives the logical call its `operation_id` in LiteLLM's metadata of the request, with a tag under the
   process's secret; post-call reads it back only with that tag, so both phases carry the same one and an ID the
   caller wrote there is never taken for it. Post-call learns the call's type from LiteLLM's logging object, or else
@@ -40,6 +42,7 @@ from litellm.integrations.custom_guardrail import CustomGuardrail
 from litellm.litellm_core_utils.api_route_to_call_types import get_call_types_for_route
 from litellm.litellm_core_utils.core_helpers import get_or_create_metadata_bucket
 from litellm.types.guardrails import GuardrailEventHooks, Mode
+from litellm.types.utils import GuardrailTracingDetail
 
 from collieai_guardrail.config import (
     DEFAULT_DEADLINE_MS,
@@ -49,6 +52,8 @@ from collieai_guardrail.config import (
     DEFAULT_SYNTHETIC_INTERVAL_S,
     AdapterConfig,
     ConfigError,
+    guardrail_name,
+    named,
 )
 from collieai_guardrail.counters import Counters
 from collieai_guardrail.heartbeat import Heartbeat
@@ -103,9 +108,13 @@ class CollieAIGuardrail(CustomGuardrail):
         except (ValueError, TypeError) as error:  # LiteLLM's loader would swallow it and start without the guardrail
             raise ConfigError(f"the guardrail's settings were refused ({type(error).__name__})") from error
         _make_visible(logger)
+        name = guardrail_name(self.guardrail_name)
+        self._named = named(name)
         self.counters = Counters()
         self._logged_calls = LoggedCalls()
-        self.observer = Observer(self.config, litellm_version=_litellm_version(), client=client, counters=self.counters)
+        self.observer = Observer(
+            self.config, litellm_version=_litellm_version(), client=client, counters=self.counters, name=name
+        )
         self._owns_client = client is None
         self._registered = False
         self.heartbeat = Heartbeat(
@@ -115,6 +124,7 @@ class CollieAIGuardrail(CustomGuardrail):
             synthetic_interval_s=self.config.synthetic_interval_s,
             retired=self._retired,
             on_retired=self._release,
+            name=name,
         )
         self._warn_about_wiring()
         self.heartbeat.ensure_running()
@@ -132,7 +142,11 @@ class CollieAIGuardrail(CustomGuardrail):
             outcome = await self.observer.observe_request(data, call_type=call_type_of(call_type), facts=facts)
             self._record(data, outcome, GuardrailEventHooks.pre_call, started, operation_id)
         except Exception as error:  # a cancellation goes on; nothing else reaches LiteLLM
-            logger.warning("collieai guardrail pre_call: the glue failed (%s); the call goes on", type(error).__name__)
+            logger.warning(
+                "collieai guardrail pre_call: the glue failed (%s); the call goes on%s",
+                type(error).__name__,
+                self._named,
+            )
         return None
 
     async def async_post_call_success_hook(
@@ -147,7 +161,11 @@ class CollieAIGuardrail(CustomGuardrail):
             outcome = await self.observer.observe_response(data, response, call_type=call_type, facts=facts)
             self._record(data, outcome, GuardrailEventHooks.post_call, started, operation_id)
         except Exception as error:
-            logger.warning("collieai guardrail post_call: the glue failed (%s); the call goes on", type(error).__name__)
+            logger.warning(
+                "collieai guardrail post_call: the glue failed (%s); the call goes on%s",
+                type(error).__name__,
+                self._named,
+            )
         return None
 
     # ------------------------------------------------------------------ the count apart from the hooks
@@ -167,7 +185,9 @@ class CollieAIGuardrail(CustomGuardrail):
         try:
             count_logged(self.counters, kwargs, response, succeeded=succeeded, calls=self._logged_calls)
         except Exception as error:
-            logger.warning("collieai guardrail: counting a logged call failed (%s)", type(error).__name__)
+            logger.warning(
+                "collieai guardrail: counting a logged call failed (%s)%s", type(error).__name__, self._named
+            )
 
     # ------------------------------------------------------------------ helpers
 
@@ -183,6 +203,7 @@ class CollieAIGuardrail(CustomGuardrail):
             duration=outcome.duration_s,
             guardrail_provider=PROVIDER,
             event_type=event,
+            tracing_detail=_tracing_detail(outcome),
         )
 
     def _retired(self) -> bool:
@@ -209,13 +230,26 @@ class CollieAIGuardrail(CustomGuardrail):
         for hook in HOOKS:
             if hook.value not in hooks:
                 logger.warning(
-                    "collieai guardrail: mode has no %s; that phase is not observed (set mode: [pre_call, post_call])",
+                    "collieai guardrail: mode has no %s; that phase is not observed"
+                    " (set mode: [pre_call, post_call])%s",
                     hook.value,
+                    self._named,
                 )
         if not self.default_on:
             logger.warning(
-                "collieai guardrail: default_on is false; only requests that name the guardrail are observed"
+                "collieai guardrail: default_on is false; only requests that name the guardrail are observed%s",
+                self._named,
             )
+
+
+def _tracing_detail(outcome: Outcome) -> GuardrailTracingDetail | None:
+    """A completed check's action and what it found, for the fields of LiteLLM's record its logs keep as they are;
+    none where no check was made."""
+    if outcome.guardrail_action is None:
+        return None
+    return GuardrailTracingDetail(
+        guardrail_action=outcome.guardrail_action, violation_categories=outcome.violation_categories
+    )
 
 
 def _metadata(data: dict[str, object]) -> dict[str, object]:

@@ -7,10 +7,10 @@ the outcome is a value the LiteLLM glue records. Every outcome is exactly one of
 reason, or outside the supported profile by reason. Whatever a reply says, it is read by the deadline or it is
 `timeout`.
 
-Logs carry the phase, the reason, a fixed detail code and the HTTP status — never a text, a key or an identifier
-of the user's call. A bypass of a call is logged at WARNING at most once a minute per phase and reason, with the
-number held back since; the counters have every one. A synthetic check's (`count=False`) is not: the heartbeat
-reports its outcome, and it takes no place of a call's warning.
+Logs carry the phase, the reason, a detail code, the HTTP status, the rule a refusal names and the guardrail's name —
+never a text, a key or an identifier of the user's call. A bypass of a call is logged at WARNING at most once a minute
+per phase and reason, with the number held back since; the counters have every one. A synthetic check's
+(`count=False`) is not: the heartbeat reports its outcome, and it takes no place of a call's warning.
 """
 
 from __future__ import annotations
@@ -25,12 +25,12 @@ from typing import Literal
 import httpx
 
 from collieai_guardrail import __version__
-from collieai_guardrail.config import MAX_REPLY_BYTES, AdapterConfig
+from collieai_guardrail.config import MAX_REPLY_BYTES, AdapterConfig, named
 from collieai_guardrail.counters import Counters
 from collieai_guardrail.eligibility import request_outside_reason, response_text
 from collieai_guardrail.payload import CallFacts, Sender, encode, post_call_payload, pre_call_payload
 from collieai_guardrail.transport import Failure, new_client, post_once
-from collieai_guardrail.verdict import Check, Rejected, error_reason, parse_check
+from collieai_guardrail.verdict import Check, Rejected, error_detail, error_reason, parse_check
 
 logger = logging.getLogger("collieai_guardrail")
 
@@ -38,7 +38,9 @@ PRE_CALL = "pre_call"
 POST_CALL = "post_call"
 #: LiteLLM's `GuardrailStatus` for each result. A check that found something is `guardrail_flagged` — LiteLLM's
 #: «allowed content through but recorded a non-blocking violation»: Monitor never intervenes, so never
-#: `guardrail_intervened`. A bypass is never `success`.
+#: `guardrail_intervened`. One that found nothing where a rule did not run gave no full answer:
+#: `guardrail_failed_to_respond`, as a bypass. What was found comes first: a partial result that found something is
+#: flagged. A bypass is never `success`.
 GuardrailStatus = Literal["success", "guardrail_flagged", "guardrail_failed_to_respond", "not_run"]
 GUARDRAIL_STATUS: dict[str, GuardrailStatus] = {
     "completed": "success",
@@ -46,6 +48,9 @@ GUARDRAIL_STATUS: dict[str, GuardrailStatus] = {
     "outside": "not_run",
 }
 FLAGGED_STATUS: GuardrailStatus = "guardrail_flagged"
+DEGRADED_STATUS: GuardrailStatus = "guardrail_failed_to_respond"
+#: LiteLLM's `guardrail_action` of a completed check: the route's own action, never what Enforce would have done.
+GUARDRAIL_ACTION = "NONE"
 WARNING_INTERVAL_S = 60.0
 
 
@@ -58,12 +63,27 @@ class Outcome:
     http_status: int | None = None
     check: Check | None = None
     duration_s: float = 0.0
+    rule_id: str | None = None  # the rule a refusal names
 
     @property
     def guardrail_status(self) -> GuardrailStatus:
         if self.check is not None and self.check.flagged:
             return FLAGGED_STATUS
+        if self.check is not None and self.check.coverage_state == "degraded":
+            return DEGRADED_STATUS
         return GUARDRAIL_STATUS[self.result]
+
+    @property
+    def guardrail_action(self) -> str | None:
+        """For LiteLLM's `guardrail_action`, which its logs keep unredacted: the route's action of a completed check;
+        None where no check was made."""
+        return GUARDRAIL_ACTION if self.check is not None else None
+
+    @property
+    def violation_categories(self) -> list[str] | None:
+        """For LiteLLM's `violation_categories`, which its logs keep unredacted: the rule types of what the check
+        found; None where it found nothing or no check was made."""
+        return list(self.check.categories) if self.check is not None and self.check.categories else None
 
     def diagnostics(self) -> dict[str, object]:
         """For LiteLLM's standard guardrail log: no text. What the check found (`would`), what happened to the call
@@ -84,6 +104,8 @@ class Outcome:
                 out["detail"] = self.detail
             if self.http_status is not None:
                 out["http_status"] = self.http_status
+            if self.rule_id is not None:
+                out["rule_id"] = self.rule_id
         return out
 
 
@@ -95,8 +117,13 @@ class Observer:
         litellm_version: str | None = None,
         client: httpx.AsyncClient | None = None,
         counters: Counters | None = None,
+        name: str | None = None,
     ) -> None:
+        """`name` — the guardrail's name in LiteLLM, for its warnings: a proxy may have more than one CollieAi
+        guardrail."""
         self.config = config
+        self.name = name
+        self._named = named(name)
         self.counters = counters if counters is not None else Counters()
         self._sender = Sender(adapter_version=__version__, litellm_version=litellm_version, budget_ms=config.budget_ms)
         # made here, not on the first call: two first calls at once would otherwise make two. httpx binds a client
@@ -194,6 +221,7 @@ class Observer:
         parsed: Check | Rejected | None = None
         reason: str = "protocol"
         detail: str | None = None
+        rule_id: str | None = None
         if sent.status == 200:
             parsed = parse_check(sent.body, phase=phase)
             detail = parsed.detail if isinstance(parsed, Rejected) else None
@@ -201,11 +229,12 @@ class Observer:
             detail = "status"
         else:
             reason = error_reason(sent.status, sent.body)
+            detail, rule_id = error_detail(sent.body)
         # a reply read after the deadline is no answer, whatever it says: a late result is not a check
         if loop.time() > deadline:
             return self._bypass(tally, phase, "timeout", started, detail="late", http_status=sent.status)
         if not isinstance(parsed, Check):
-            return self._bypass(tally, phase, reason, started, detail=detail, http_status=sent.status)
+            return self._bypass(tally, phase, reason, started, detail=detail, http_status=sent.status, rule_id=rule_id)
         tally.add(phase, "completed")
         logger.debug("collieai guardrail %s: completed, coverage %s", phase, parsed.coverage_state)
         return Outcome(phase, "completed", check=parsed, http_status=200, duration_s=loop.time() - started)
@@ -229,10 +258,11 @@ class Observer:
         *,
         detail: str | None = None,
         http_status: int | None = None,
+        rule_id: str | None = None,
     ) -> Outcome:
         tally.add_reason(phase, "bypass", reason)
         if tally is self.counters:  # a call's; a synthetic check counts apart, and the heartbeat reports it
-            self._warn(phase, reason, detail, http_status)
+            self._warn(phase, reason, detail, http_status, rule_id)
         return Outcome(
             phase,
             "bypass",
@@ -240,9 +270,10 @@ class Observer:
             detail=detail,
             http_status=http_status,
             duration_s=asyncio.get_running_loop().time() - started,
+            rule_id=rule_id,
         )
 
-    def _warn(self, phase: str, reason: str, detail: str | None, http_status: int | None) -> None:
+    def _warn(self, phase: str, reason: str, detail: str | None, http_status: int | None, rule_id: str | None) -> None:
         now = time.monotonic()
         last, held = self._warned.get((phase, reason), (float("-inf"), 0))
         if now - last < WARNING_INTERVAL_S:
@@ -250,11 +281,13 @@ class Observer:
             return
         self._warned[(phase, reason)] = (now, 0)
         logger.warning(
-            "collieai guardrail %s: observation bypassed (%s, detail=%s, http_status=%s); the call goes on unchanged"
-            " (%d more held back since the last warning)",
+            "collieai guardrail %s: observation bypassed (%s, detail=%s, http_status=%s, rule_id=%s); the call goes on"
+            " unchanged (%d more held back since the last warning)%s",
             phase,
             reason,
             detail,
             http_status,
+            rule_id,
             held,
+            self._named,
         )

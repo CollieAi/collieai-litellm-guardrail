@@ -9,7 +9,7 @@ checks each eligible chat call against your [CollieAi](https://collieai.io)
 policy, before and after the model call. It runs in **Monitor** mode: it
 never changes or blocks a call, and never delays one beyond its own
 deadline. What CollieAi found goes into LiteLLM's guardrail log and
-CollieAi's audit. This release is a beta and only observes.
+CollieAi's Logs. This release is a beta and only observes.
 
 You need a CollieAi project and its API key (`clai_…`). Rule support is
 decided by CollieAi's server execution profile, not by this adapter: read
@@ -22,11 +22,23 @@ decided by CollieAi's server execution profile, not by this adapter: read
 
 ## Install
 
-Into the LiteLLM proxy's Python environment (or its image):
+Into the LiteLLM proxy's Python environment:
 
 ```bash
 pip install collieai-litellm-guardrail
 ```
+
+The official LiteLLM image (`ghcr.io/berriai/litellm`) has no `pip` in its
+environment, so `RUN pip install …` fails with `pip: not found`. Bootstrap it
+first:
+
+```dockerfile
+FROM ghcr.io/berriai/litellm:v1.102.4
+RUN python3 -m ensurepip \
+ && python3 -m pip install --no-cache-dir collieai-litellm-guardrail
+```
+
+Checked with the `v1.102.4` and `v1.106.0` images.
 
 ## Configure
 
@@ -80,11 +92,11 @@ start stops instead of running unobserved. Two cases stay LiteLLM's:
 
 ## Your project's policy
 
-With CollieAi's `stage1a-monitor-all-v1` server profile, the beta runs every
-message rule selected for the phase: Input rules for pre-call and Output
-rules for post-call. The adapter has no list of rule types. Rules still run
-only in Monitor, so a finding is reported but never changes the model request
-or response.
+With CollieAi's `stage1a-monitor-all-v2` server profile, which
+app.collieai.io runs, the beta runs every message rule selected for the
+phase: Input rules for pre-call and Output rules for post-call. The adapter
+has no list of rule types to run. Rules still run only in Monitor, so a
+finding is reported but never changes the model request or response.
 
 The server admits the complete selected policy before the first detector. If
 one configuration is unsafe for synchronous execution or needs input the
@@ -93,19 +105,26 @@ unchanged, and the phase is a bypass `capability`. Examples include:
 
 - an unbounded regex such as nested or variable repetition;
 - more than 16 rules for one direction, or more than 8 dictionary rules;
-- a dictionary rule on a dictionary group, a dictionary over 256 KiB, or a
-  match mode other than `substring` with `whole_word` on;
+- a dictionary rule on a dictionary group other than CollieAi's own
+  `prompt-security` (`aho_group_content`), or one that would match more
+  than two of its languages (`aho_group_languages`);
+- a dictionary over 256 KiB, or a match mode other than `substring` with
+  `whole_word` on;
 - a `normalization` rule with `trim_punctuation`;
 - inbound LLM conversation checking, because this adapter does not send a
   complete CollieAi conversation context.
 
-Servers still using the rollback profiles `stage1a-narrow-v1` or
+The previous profile, `stage1a-monitor-all-v1`, admits no dictionary group,
+so it refuses the Starter policy's `prompt-security` rule, and it counts a
+rule that does not apply to a text (a URL check of a text without URLs) as
+degraded. Servers still using the rollback profiles `stage1a-narrow-v1` or
 `stage1a-wide-v1` accept only dictionary matching and normalization. The
 server's `profile` diagnostic tells you which profile answered.
 
-CollieAi's Logs show such a check with the error `capability:<what>`, for
-example `capability:rule_type`. The synthetic check at start meets the
-same refusal and logs `bypass:capability`.
+The bypass WARNING names what was refused and the rule:
+`detail=aho_group_content, rule_id=…`. CollieAi's Logs show the check with
+the error `capability:<what>`. The synthetic check at start meets the same
+refusal and logs `bypass:capability` with the same detail.
 
 **Set the policy up before you connect the proxy.** Confirm that every rule's
 configuration is admitted by the server profile:
@@ -157,21 +176,51 @@ the defaults.
 Each phase adds a `StandardLoggingGuardrailInformation` record with
 `guardrail_provider: collieai`.
 
+CollieAi names each finding's `kind`:
+- `detection`: a rule found what it looks for. This is a violation, whether
+  the policy is in Monitor or Enforce;
+- `allow`: a rule with the `allow` action matched;
+- `operational_failure`: a detector failed. The finding records that; it
+  is no violation.
+
+Only a `detection` flags the check.
+
 **`guardrail_status`:**
 
 | Status | When |
 |---|---|
-| `success` | The check found nothing |
-| `guardrail_flagged` | The check found something Enforce would mask or block. The call still went through unchanged |
-| `guardrail_failed_to_respond` | Bypass: no check |
+| `guardrail_flagged` | The check found a `detection`, also when some rule did not run. The call still went through unchanged |
+| `guardrail_failed_to_respond` | No `detection`, and some rule did not run (coverage `degraded`): no full answer. Or a bypass: no check |
+| `success` | No `detection`, and every rule that applies ran |
 | `not_run` | Outside the supported profile |
+
+A CollieAi server before 2026.10.23 names no kind. With it,
+`guardrail_flagged` means Enforce would mask or block, as in 0.1.0.
+
+**`guardrail_action` and `violation_categories`.** LiteLLM keeps these two
+fields where its spend logs redact `guardrail_response`
+(`store_prompts_in_spend_logs: false`, LiteLLM's default):
+
+| Field | Completed check | Bypass, outside |
+|---|---|---|
+| `guardrail_action` | `"NONE"`: the route's own action. Monitor never acts, and this is not what Enforce would do | `null` |
+| `violation_categories` | The rule types of the detections, unique and sorted, for example `["aho_corasick", "structured_id"]`. `null` when nothing was detected | `null` |
+
+A category is one of CollieAi's message rule types: `aho_corasick`,
+`base64_payload`, `language_detection`, `lightweight_model`,
+`llm_detection`, `normalization`, `qwen3guard_stream`, `regex`,
+`structured_id`, `url_filter`, `url_reputation`; a type this version
+doesn't know is `other`. Rule names are never sent: you choose them.
 
 **`guardrail_response`** carries:
 - `result` and `effective`, which is always `allow`;
-- for a completed check: `would` (CollieAi's `would.outcome`), `degraded`, and
-  CollieAi's diagnostics: evaluation ID, coverage, rule IDs and types, timings;
-- for a bypass or a call outside the supported profile: `reason`, `detail` and
-  `http_status`;
+- for a completed check: `would` (CollieAi's `would.outcome`: what Enforce
+  of the current configuration would do; `none` in a Monitor policy),
+  `degraded`, and CollieAi's diagnostics: evaluation ID, coverage with the
+  rules that did not apply to the text and why (`not_applicable`), each
+  finding's rule ID, type and `kind`, timings;
+- for a bypass or a call outside the supported profile: `reason`, `detail`
+  and `http_status`, and `rule_id` when CollieAi's refusal names a rule;
 - `operation_id`, the same for both phases of a call. Pre-call puts it in
   the request's metadata as `collieai_operation_id`, with a tag only this
   worker process can make, `collieai_operation_tag`. Post-call and the
@@ -179,8 +228,13 @@ Each phase adds a `StandardLoggingGuardrailInformation` record with
   writes there is never used.
 
 It never carries text. LiteLLM's credential masker hides
-`policy_fingerprint`. Use `evaluation_id` or `operation_id` to find the
-check in CollieAi's audit.
+`policy_fingerprint`.
+
+In CollieAi's Logs the checks have Source `LiteLLM`. A row's LiteLLM call
+id, `metadata.litellm_call_id` in LiteLLM's record, opens every row of that
+call. The link fails when the call id is empty, has characters CollieAi
+doesn't keep, or is longer than 128; and when a client sends one
+`x-litellm-call-id` for several calls, all of them show.
 
 LiteLLM's own request and response logging is separate from this adapter:
 review what it keeps on its own.
@@ -188,12 +242,14 @@ review what it keeps on its own.
 ## Logs
 
 The adapter logs under the logger `collieai_guardrail`. It logs counts,
-phases, reason codes and HTTP statuses. It never logs a text, the key or a
-call's identifiers.
+phases, reason codes, HTTP statuses, the rule a refusal names and the
+guardrail's name. It never logs a text, the key or a call's identifiers.
+Every line but the summary ends with `(guardrail <name>)`, the
+`guardrail_name` of the proxy's config; the summary has it as `guardrail`.
 
 | Line | Level |
 |---|---|
-| `… observation bypassed (<reason>, detail=…, http_status=…)` | WARNING for a call, at most once a minute per phase and reason, with the number held back. Not for the synthetic check, which has its own line |
+| `… observation bypassed (<reason>, detail=…, http_status=…, rule_id=…)` | WARNING for a call, at most once a minute per phase and reason, with the number held back. `detail` is CollieAi's error code or the adapter's own; `rule_id` the rule a refusal names. Not for the synthetic check, which has its own line |
 | `collieai guardrail summary {json}` | INFO, every `summary_interval_s` |
 | `… LiteLLM logged N eligible calls and the hook has never run …` | WARNING: the guardrail is not wired for that phase |
 | `collieai guardrail synthetic check: …` | INFO when both phases completed, or when CollieAi answered `busy` and the check will be repeated; WARNING with each phase's reason otherwise |
@@ -214,8 +270,8 @@ among the JSON lines.
 
 ### The summary
 
-The summary holds one object per phase. Its counts cover the interval, per
-worker process:
+The summary names its guardrail (`guardrail`) and holds one object per
+phase. Its counts cover the interval, per worker process:
 
 - `hook_calls`: the hook ran;
 - `eligible`: the call is in the supported profile;
@@ -268,8 +324,9 @@ trigger it.
    start together seldom meet at CollieAi. If they do and CollieAi answers
    `busy`, the adapter logs it at INFO and repeats the check 1.5–3 s later,
    up to twice. A WARNING names what failed: `bypass:auth` for a wrong key,
-   `bypass:not_found` when the route is off, `bypass:capability` when the
-   project's policy has a rule this beta doesn't run, `bypass:transport`
+   `bypass:not_found` when the route is off, `bypass:capability` with the
+   code and the rule when the project's policy has a rule this beta doesn't
+   run, `bypass:transport`
    when the server can't be reached, `bypass:busy` when CollieAi had no free
    slot three times in a row.
 2. **Within a minute of start**, each worker writes a
