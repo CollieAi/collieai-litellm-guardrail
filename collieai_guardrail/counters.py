@@ -20,7 +20,18 @@ import threading
 from collections import Counter
 
 PHASES = ("pre_call", "post_call")
-TOTALS = ("hook_calls", "eligible", "attempted", "completed", "logged_calls", "logged_eligible", "logged_repeats")
+#: The counts by reason. `refused` — enforce with blocking only: a call refused, by the code it was refused with.
+KINDS = ("bypass", "outside", "logged_outside", "refused")
+TOTALS = (
+    "hook_calls",
+    "eligible",
+    "attempted",
+    "completed",
+    "blocked",
+    "logged_calls",
+    "logged_eligible",
+    "logged_repeats",
+)
 
 
 class Counters:
@@ -36,8 +47,8 @@ class Counters:
             self._totals[(phase, name)] += 1
 
     def add_reason(self, phase: str, kind: str, reason: str) -> None:
-        """`kind` is `bypass`, `outside` or `logged_outside`."""
-        if phase not in PHASES or kind not in ("bypass", "outside", "logged_outside"):
+        """`kind` is `bypass`, `outside`, `logged_outside` or `refused` (enforce: the call refused, by code)."""
+        if phase not in PHASES or kind not in KINDS:
             raise ValueError(f"unknown count {phase}/{kind}")
         with self._lock:
             self._by_reason[(phase, kind, reason)] += 1
@@ -49,7 +60,7 @@ class Counters:
         out: dict[str, dict[str, object]] = {}
         for phase in PHASES:
             counts: dict[str, object] = {name: totals.get((phase, name), 0) for name in TOTALS}
-            for kind in ("bypass", "outside", "logged_outside"):
+            for kind in KINDS:
                 counts[kind] = {
                     reason: n for (p, k, reason), n in sorted(by_reason.items()) if p == phase and k == kind
                 }

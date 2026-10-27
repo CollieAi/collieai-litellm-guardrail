@@ -21,9 +21,15 @@ adds it to its callbacks. It defines no `apply_guardrail`, so the proxy calls it
   drops the instance from its callbacks — the guardrail deleted, or rebuilt with changed settings — the instance
   retires: its heartbeat stops and, a deadline later, its client closes.
 
+With `enforcement_mode: block` (enforce with blocking only) a hook refuses the call the outcome says to refuse
+(`Outcome.refusal`): it records the phase first, then raises
+LiteLLM's `GuardrailRaisedException` with the status — 400 for a block or a call outside what the adapter checks
+(nothing reaches the model before the call; the model's text never reaches the client after it), 503 when the
+check could not be made. A fault of the glue itself refuses the call too. Block needs both phases and `default_on`.
+
 A setting the adapter cannot run with stops the proxy's start (`ConfigError`), `mode` included whatever
-LITELLM_STRICT_GUARDRAIL_MODES says. Past that, nothing here raises into LiteLLM but a cancellation of the call; a
-fault of the glue itself is logged and the call goes on unchanged. Unless the operator configured the
+LITELLM_STRICT_GUARDRAIL_MODES says. Past that, in Monitor nothing here raises into LiteLLM but a cancellation of the
+call; a fault of the glue itself is logged and the call goes on unchanged. Unless the operator configured the
 `collieai_guardrail` logger, the adapter makes its INFO lines show (`_make_visible`).
 """
 
@@ -38,6 +44,7 @@ from typing import Any
 
 import httpx
 import litellm
+from litellm.exceptions import GuardrailRaisedException
 from litellm.integrations.custom_guardrail import CustomGuardrail
 from litellm.litellm_core_utils.api_route_to_call_types import get_call_types_for_route
 from litellm.litellm_core_utils.core_helpers import get_or_create_metadata_bucket
@@ -64,14 +71,25 @@ from collieai_guardrail.litellm_data import (
     count_logged,
     issue_operation_id,
     issued_operation_id,
+    mark_refused,
 )
-from collieai_guardrail.observer import Observer, Outcome
+from collieai_guardrail.observer import UNAVAILABLE_CODE, Observer, Outcome
 
 logger = logging.getLogger("collieai_guardrail")
 
+PRE_CALL = GuardrailEventHooks.pre_call.value
+POST_CALL = GuardrailEventHooks.post_call.value
 PROVIDER = "collieai"
 HOOKS = (GuardrailEventHooks.pre_call, GuardrailEventHooks.post_call)
 OUR_HOOKS = frozenset(hook.value for hook in HOOKS)
+#: What a refused call's client reads, by the refusal's code: fixed text, the code in it — nothing of the policy's.
+REFUSAL_MESSAGES = {
+    "content_blocked": "Request blocked by the CollieAi policy",
+    "response_blocked": "Response blocked by the CollieAi policy",
+    "unsupported_request": "Request outside what the CollieAi guardrail checks",
+    "unsupported_response": "Response outside what the CollieAi guardrail checks",
+    UNAVAILABLE_CODE: "CollieAi guardrail unavailable",
+}
 
 
 class CollieAIGuardrail(CustomGuardrail):
@@ -86,6 +104,7 @@ class CollieAIGuardrail(CustomGuardrail):
         forward_conversation_id: bool = False,
         summary_interval_s: int = DEFAULT_SUMMARY_INTERVAL_S,
         synthetic_interval_s: int = DEFAULT_SYNTHETIC_INTERVAL_S,
+        enforcement_mode: str = "monitor",
         client: httpx.AsyncClient | None = None,
         **kwargs: Any,  # LiteLLM's own parameters, of many types, for CustomGuardrail
     ) -> None:
@@ -102,8 +121,11 @@ class CollieAIGuardrail(CustomGuardrail):
                 forward_conversation_id=forward_conversation_id,
                 summary_interval_s=summary_interval_s,
                 synthetic_interval_s=synthetic_interval_s,
+                enforcement_mode=enforcement_mode,
             )
             _check_mode(kwargs.get("event_hook"))
+            if self.config.enforce:
+                _check_enforce_wiring(kwargs.get("event_hook"), kwargs.get("default_on"))
             super().__init__(supported_event_hooks=list(HOOKS), **kwargs)
         except (ValueError, TypeError) as error:  # LiteLLM's loader would swallow it and start without the guardrail
             raise ConfigError(f"the guardrail's settings were refused ({type(error).__name__})") from error
@@ -117,6 +139,7 @@ class CollieAIGuardrail(CustomGuardrail):
         )
         self._owns_client = client is None
         self._registered = False
+        self.enforce = self.config.enforce
         self.heartbeat = Heartbeat(
             self.observer,
             self.counters,
@@ -135,24 +158,26 @@ class CollieAIGuardrail(CustomGuardrail):
         self, user_api_key_dict: object, cache: object, data: dict[str, object], call_type: object
     ) -> None:
         self.heartbeat.ensure_running()
+        outcome: Outcome | None = None
         try:
             started = time.time()
             operation_id = _issue_operation_id(data)  # a new logical call, whatever the request's metadata says
             facts = call_facts(data, operation_id=operation_id)
             outcome = await self.observer.observe_request(data, call_type=call_type_of(call_type), facts=facts)
             self._record(data, outcome, GuardrailEventHooks.pre_call, started, operation_id)
+            if outcome.refusal is not None:
+                mark_refused(_metadata(data), PRE_CALL, operation_id, _counted_reason(outcome))
         except Exception as error:  # a cancellation goes on; nothing else reaches LiteLLM
-            logger.warning(
-                "collieai guardrail pre_call: the glue failed (%s); the call goes on%s",
-                type(error).__name__,
-                self._named,
-            )
+            self._glue_failed(PRE_CALL, error, data, outcome)
+            return None
+        self._refuse_if_asked(outcome)
         return None
 
     async def async_post_call_success_hook(
         self, data: dict[str, object], user_api_key_dict: object, response: object
     ) -> None:
         self.heartbeat.ensure_running()
+        outcome: Outcome | None = None
         try:
             started = time.time()
             operation_id = _operation_id(data)
@@ -160,13 +185,49 @@ class CollieAIGuardrail(CustomGuardrail):
             call_type = _post_call_type(data, user_api_key_dict)
             outcome = await self.observer.observe_response(data, response, call_type=call_type, facts=facts)
             self._record(data, outcome, GuardrailEventHooks.post_call, started, operation_id)
+            if outcome.refusal is not None:
+                mark_refused(_metadata(data), POST_CALL, operation_id, _counted_reason(outcome))
         except Exception as error:
-            logger.warning(
-                "collieai guardrail post_call: the glue failed (%s); the call goes on%s",
-                type(error).__name__,
-                self._named,
-            )
+            self._glue_failed(POST_CALL, error, data, outcome)
+            return None
+        self._refuse_if_asked(outcome)
         return None
+
+    def _glue_failed(self, phase: str, error: Exception, data: dict[str, object], outcome: Outcome | None) -> None:
+        """A fault of the glue itself: in Monitor the call goes on; in block it is refused, as a check not made — with
+        its mark when the call has its ID, so the count still sees it under the reason the outcome had, if any."""
+        logger.warning(
+            "collieai guardrail %s: the glue failed (%s); %s%s",
+            phase,
+            type(error).__name__,
+            "the call is refused (enforcement_mode: block)" if self.enforce else "the call goes on",
+            self._named,
+        )
+        if self.enforce:
+            try:
+                operation_id = issued_operation_id(_metadata(data))
+                if operation_id is not None:
+                    mark_refused(_metadata(data), phase, operation_id, _counted_reason(outcome))
+            except Exception:  # the refusal stands; only the count may miss it
+                pass
+            raise self._refusal(503, UNAVAILABLE_CODE, blocked_content=False) from None
+
+    def _refuse_if_asked(self, outcome: Outcome) -> None:
+        """Block only: refuse the call as the outcome says, after it was recorded. Never in Monitor."""
+        if not self.enforce or outcome.refusal is None:
+            return
+        status, code = outcome.refusal
+        raise self._refusal(status, code, blocked_content=outcome.check is not None and outcome.check.blocked)
+
+    def _refusal(self, status: int, code: str, *, blocked_content: bool) -> GuardrailRaisedException:
+        """LiteLLM's own refusal of a guardrail: the client gets `status` and the fixed text with the code."""
+        return GuardrailRaisedException(
+            guardrail_name=self.guardrail_name,
+            message=f"{REFUSAL_MESSAGES[code]} ({code})",
+            should_wrap_with_default_message=False,
+            status_code=status,
+            blocked_content=blocked_content,
+        )
 
     # ------------------------------------------------------------------ the count apart from the hooks
 
@@ -226,6 +287,8 @@ class CollieAIGuardrail(CustomGuardrail):
             await self.observer.aclose()
 
     def _warn_about_wiring(self) -> None:
+        if self.enforce:  # refused at the start instead (`_check_enforce_wiring`)
+            return
         hooks = _hooks(self.event_hook)
         for hook in HOOKS:
             if hook.value not in hooks:
@@ -240,6 +303,11 @@ class CollieAIGuardrail(CustomGuardrail):
                 "collieai guardrail: default_on is false; only requests that name the guardrail are observed%s",
                 self._named,
             )
+
+
+def _counted_reason(outcome: Outcome | None) -> str | None:
+    """The reason the count takes a refused phase under: an outside call's, None for an eligible one."""
+    return outcome.reason if outcome is not None and outcome.result == "outside" else None
 
 
 def _tracing_detail(outcome: Outcome) -> GuardrailTracingDetail | None:
@@ -299,6 +367,15 @@ def _check_mode(event_hook: object) -> None:
     named = [call_type_of(hook) for hook in _named_hooks(event_hook)]
     if not named or any(hook not in OUR_HOOKS for hook in named):
         raise ConfigError("mode must be pre_call, post_call or both")
+
+
+def _check_enforce_wiring(event_hook: object, default_on: object) -> None:
+    """Block refuses what it could not check, so a phase it does not see, or a request that does not name the
+    guardrail, would go through unchecked: both phases and `default_on: true` or the proxy does not start."""
+    if _hooks(event_hook) != set(OUR_HOOKS):
+        raise ConfigError("enforcement_mode block needs mode: [pre_call, post_call]")
+    if default_on is not True:
+        raise ConfigError("enforcement_mode block needs default_on: true")
 
 
 def _hooks(event_hook: object) -> set[str]:

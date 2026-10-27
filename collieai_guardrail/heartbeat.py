@@ -229,6 +229,7 @@ class Heartbeat:
                 "collieai guardrail synthetic check failed inside the adapter (%s)%s", type(error).__name__, self._named
             )
             self._synthetic = {PRE_CALL: "error", POST_CALL: "error"}
+            self._report_refusing()
             return None
         self._synthetic = {PRE_CALL: describe(pre), POST_CALL: describe(post)}
         if pre.result == post.result == "completed":
@@ -255,7 +256,18 @@ class Heartbeat:
                 post.rule_id,
                 self._named,
             )
+            self._report_refusing()
         return pre, post
+
+    def _report_refusing(self) -> None:
+        """In block a failed synthetic check means the calls' checks are likely failing the same way, and each such
+        call is refused: an ERROR, whatever failed."""
+        if self._observer.config.enforce:
+            logger.error(
+                "collieai guardrail synthetic check failed in enforcement_mode block: calls are likely being"
+                " refused (503 guardrail_unavailable)%s",
+                self._named,
+            )
 
     def summarize(self) -> dict[str, object] | None:
         try:
