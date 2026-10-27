@@ -28,7 +28,13 @@ from collieai_guardrail.config import AdapterConfig, ConfigError  # noqa: E402
 from collieai_guardrail.counters import Counters  # noqa: E402
 from collieai_guardrail.guardrail import CollieAIGuardrail  # noqa: E402
 from collieai_guardrail.heartbeat import Heartbeat  # noqa: E402
-from collieai_guardrail.litellm_data import LoggedCalls, count_logged, issue_operation_id, mark_refused  # noqa: E402
+from collieai_guardrail.litellm_data import (  # noqa: E402
+    LoggedCalls,
+    count_logged,
+    count_refused,
+    issue_operation_id,
+    mark_refused,
+)
 from collieai_guardrail.observer import Observer  # noqa: E402
 from collieai_guardrail.payload import CallFacts, Sender, pre_call_payload  # noqa: E402
 from collieai_guardrail.verdict import Check, Rejected, parse_check  # noqa: E402
@@ -482,29 +488,58 @@ def _logged(metadata: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
     }
 
 
-def test_our_own_refusal_before_the_model_is_seen_not_rejected() -> None:
-    counters = Counters()
-    metadata: dict[str, Any] = {}
-    operation_id = issue_operation_id(metadata)
-    mark_refused(metadata, "pre_call", operation_id, None)
-
-    count_logged(
-        counters, _logged(metadata, litellm_no_upstream_llm_call=True), None, succeeded=False, calls=LoggedCalls()
+def _logged_counts(counters: Counters) -> tuple[Any, ...]:
+    """Per phase: logged calls, of them eligible, and further attempts."""
+    snapshot = counters.snapshot()
+    return tuple(
+        (snapshot[p]["logged_calls"], snapshot[p]["logged_eligible"], snapshot[p]["logged_repeats"])
+        for p in ("pre_call", "post_call")
     )
 
-    pre = counters.snapshot()["pre_call"]
-    assert (pre["logged_eligible"], pre["logged_outside"]) == (1, {})
+
+@pytest.mark.parametrize("event", ["none", "rejected", "failed"])
+@pytest.mark.parametrize("phase", ["pre_call", "post_call"])
+def test_our_own_refusal_is_counted_once_whatever_litellm_logs(phase: str, event: str) -> None:
+    """LiteLLM logs a guardrail's refusal by its version: not at all, or as a call its proxy refused (also after the
+    model), or as a failed one. The refusal is counted when it is made, and the event about it, if any, skipped."""
+    counters, calls = Counters(), LoggedCalls()
+    metadata: dict[str, Any] = {}
+    operation_id = issue_operation_id(metadata)
+    mark_refused(metadata, phase, operation_id, None)
+    count_refused(counters, phase, None, operation_id=operation_id, calls=calls)
+
+    if event != "none":
+        extra = {"litellm_no_upstream_llm_call": True} if event == "rejected" else {}
+        count_logged(counters, _logged(metadata, **extra), RuntimeError("refused"), succeeded=False, calls=calls)
+
+    assert _logged_counts(counters) == ((1, 1, 0), (1, 1, 0) if phase == "post_call" else (0, 0, 0))
 
 
-def test_our_own_refusal_after_the_model_counts_the_phase() -> None:
+def test_a_refusal_after_the_model_counts_the_pre_call_phase_by_the_request() -> None:
     counters = Counters()
     metadata: dict[str, Any] = {}
     operation_id = issue_operation_id(metadata)
+
+    count_refused(counters, "post_call", "reasoning", operation_id=operation_id, request_reason="call_type")
+
+    snapshot = counters.snapshot()
+    assert (snapshot["pre_call"]["logged_outside"], snapshot["post_call"]["logged_outside"]) == (
+        {"call_type": 1},
+        {"reasoning": 1},
+    )
+
+
+def test_a_refusal_after_a_logged_attempt_counts_the_pre_call_phase_once() -> None:
+    """The router logged a failed attempt of the call before the one the guardrail refused after the model."""
+    counters, calls = Counters(), LoggedCalls()
+    metadata: dict[str, Any] = {}
+    operation_id = issue_operation_id(metadata)
+    count_logged(counters, _logged(metadata), RuntimeError("attempt"), succeeded=False, calls=calls)
+
     mark_refused(metadata, "post_call", operation_id, None)
+    count_refused(counters, "post_call", None, operation_id=operation_id, calls=calls)
 
-    count_logged(counters, _logged(metadata), RuntimeError("refused"), succeeded=False, calls=LoggedCalls())
-
-    assert counters.snapshot()["post_call"]["logged_eligible"] == 1
+    assert _logged_counts(counters) == ((1, 1, 0), (1, 1, 0))
 
 
 def test_a_mark_the_caller_wrote_is_not_taken() -> None:
@@ -625,16 +660,29 @@ async def test_a_fault_of_the_glue_marks_its_refusal(loaded: Any, monkeypatch: p
             data=data,
             call_type="acompletion",
         )
-    counters = Counters()
-    count_logged(
-        counters,
-        _logged(data["metadata"], litellm_no_upstream_llm_call=True),
-        None,
-        succeeded=False,
-        calls=LoggedCalls(),
-    )
+    guardrail._count_logged(_logged(data["metadata"], litellm_no_upstream_llm_call=True), None, succeeded=False)
 
-    assert counters.snapshot()["pre_call"]["logged_eligible"] == 1
+    assert _logged_counts(guardrail.counters) == ((1, 1, 0), (0, 0, 0))
+
+
+async def test_a_refusal_after_the_model_counts_an_outside_request_by_its_reason(
+    loaded: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fault of the glue after the model of a call outside by its type: its pre-call phase counts under that type."""
+    guardrail = loaded(MockServer(json_reply(200, enforce_reply())))
+    data = copy.deepcopy(chat_request())
+    issue_operation_id(data["metadata"])
+
+    def broken(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("glue")
+
+    monkeypatch.setattr(guardrail, "_record", broken)
+    with pytest.raises(GuardrailRaisedException):
+        await guardrail.async_post_call_success_hook(
+            data=data, user_api_key_dict=UserAPIKeyAuth(request_route="/v1/embeddings"), response=chat_response()
+        )
+
+    assert guardrail.counters.snapshot()["pre_call"]["logged_outside"] == {"call_type": 1}
 
 
 @pytest.mark.parametrize("phase", ["pre_call", "post_call"])
@@ -658,10 +706,11 @@ async def test_a_fault_of_the_glue_keeps_the_outside_reason(
             await guardrail.async_post_call_success_hook(
                 data=data, user_api_key_dict=auth, response=chat_response(reasoning_content="thinking")
             )
-    counters = Counters()
     logged = _logged(data["metadata"], **({"litellm_no_upstream_llm_call": True} if phase == "pre_call" else {}))
-    count_logged(counters, logged, RuntimeError("refused"), succeeded=False, calls=LoggedCalls())
+    guardrail._count_logged(logged, RuntimeError("refused"), succeeded=False)
 
-    snapshot = counters.snapshot()[phase]
+    snapshot = guardrail.counters.snapshot()
     want = "non_text_output" if phase == "pre_call" else "reasoning"
-    assert (snapshot["logged_eligible"], snapshot["logged_outside"]) == (0, {want: 1})
+    assert (snapshot[phase]["logged_eligible"], snapshot[phase]["logged_outside"]) == (0, {want: 1})
+    if phase == "post_call":
+        assert (snapshot["pre_call"]["logged_eligible"], snapshot["pre_call"]["logged_outside"]) == (1, {})

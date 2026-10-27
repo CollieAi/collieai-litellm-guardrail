@@ -345,7 +345,9 @@ phase. Its counts cover the interval, per worker process:
   LiteLLM takes it from the caller's `x-litellm-call-id` header, and a
   client may send one for a whole session. A call pre-call never saw has
   no `operation_id`, so each of its attempts counts as a call: a hook that
-  does not run still shows.
+  does not run still shows. A call this guardrail refused
+  (`enforcement_mode: block`) is counted when it is refused, whatever
+  LiteLLM logs about it.
   `logged_outside` has the reasons above and two of its own:
   - `rejected`: the proxy itself refused the call: a bad key, a limit, a
     budget, or another guardrail's block, before the model or after it;

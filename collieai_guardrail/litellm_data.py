@@ -11,7 +11,8 @@
   `rejected`. A background health check of a model has no messages: outside, `malformed`. A call the router retries
   is logged once per attempt and counted once (`LoggedCalls`): every attempt carries the request's metadata, and in it
   the `operation_id` pre-call issued with its tag. Not by `litellm_call_id`: the proxy takes that from the caller's
-  `x-litellm-call-id` header, so two calls can share one.
+  `x-litellm-call-id` header, so two calls can share one. A call this guardrail refused (enforce) is counted at the
+  refusal: LiteLLM logs a guardrail's refusal or not by its version, so an event with the refusal's mark is skipped.
 - The logical call's `operation_id` in the request's metadata, with its tag under this process's secret: issued by
   pre-call, and taken back — by post-call, by the count — only with that tag.
 
@@ -130,10 +131,9 @@ def logged_operation_id(kwargs: Mapping[str, object]) -> str | None:
 
 
 def mark_refused(metadata: dict[str, object], phase: str, operation_id: str, reason: str | None) -> None:
-    """Enforce: this phase refused the call. LiteLLM logs it as a failure — before the model a call its proxy refused
-    (`rejected`), after it one that never succeeded — so the count takes the phase as seen, by `reason` (None: the
-    call was eligible), as it would have had the call gone on: else `logged_unseen` would drift by every refusal.
-    Tagged as the operation's ID is, so only a mark this process made is taken."""
+    """Enforce: this phase refused the call, counted at the refusal (`count_refused`). Whether LiteLLM logs a
+    guardrail's refusal depends on its version, so `count_logged` skips an event with this mark. Tagged as the
+    operation's ID is, so only a mark this process made is taken."""
     value = reason or ""
     metadata[_REFUSED_KEYS[phase]] = f"{value}:{_operation_tag(f'refused:{phase}:{operation_id}:{value}')}"
 
@@ -211,17 +211,14 @@ def count_logged(
     nothing else. An event without that ID is a call of its own: pre-call did not run for it, and a hook that did not
     run must show."""
     call_id = logged_operation_id(kwargs)
-    pre_refused = None if succeeded else refused_by_us(kwargs, PRE_CALL, call_id)
-    post_refused = None if succeeded else refused_by_us(kwargs, POST_CALL, call_id)
-    seen_post = succeeded or post_refused is not None
-    first, first_success = calls.see(call_id, succeeded=seen_post) if calls and call_id else (True, seen_post)
+    if not succeeded and any(refused_by_us(kwargs, phase, call_id) is not None for phase in (PRE_CALL, POST_CALL)):
+        return  # our own refusal, counted when it was made
+    first, first_success = calls.see(call_id, succeeded=succeeded) if calls and call_id else (True, succeeded)
     if not first:
         counters.add(PRE_CALL, "logged_repeats")
     reason: str | None
     try:
-        if pre_refused is not None:  # our own refusal before the model, not another's
-            reason = pre_refused[0]
-        elif kwargs.get(NO_UPSTREAM_CALL):
+        if kwargs.get(NO_UPSTREAM_CALL):
             reason = REJECTED
         else:
             reason = request_outside_reason(logged_request(kwargs), call_type_of(kwargs.get("call_type")))
@@ -232,14 +229,32 @@ def count_logged(
     if not first_success:
         return
     if reason is None:
-        if post_refused is not None:  # refused after the model: the response never reached the log
-            reason = post_refused[0]
-        else:
-            try:
-                _, reason = response_text(response)
-            except Exception:
-                reason = "malformed"
+        try:
+            _, reason = response_text(response)
+        except Exception:
+            reason = "malformed"
     _count(counters, POST_CALL, reason)
+
+
+def count_refused(
+    counters: Counters,
+    phase: str,
+    reason: str | None,
+    *,
+    operation_id: str | None,
+    request_reason: str | None = None,
+    calls: LoggedCalls | None = None,
+) -> None:
+    """Count a call this guardrail refused as `count_logged` counts one LiteLLM logged, at the refusal: by `reason`
+    (None: the phase was eligible). A refusal after the model also counts the call's pre-call phase, by
+    `request_reason`, unless an earlier attempt's event counted it."""
+    first = True
+    if phase == POST_CALL and calls is not None and operation_id is not None:
+        first, _ = calls.see(operation_id, succeeded=True)
+    if phase == PRE_CALL or first:
+        _count(counters, PRE_CALL, reason if phase == PRE_CALL else request_reason)
+    if phase == POST_CALL:
+        _count(counters, POST_CALL, reason)
 
 
 def _count(counters: Counters, phase: str, reason: str | None) -> None:
