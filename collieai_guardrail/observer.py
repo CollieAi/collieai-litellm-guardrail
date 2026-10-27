@@ -7,6 +7,11 @@ the outcome is a value the LiteLLM glue records. Every outcome is exactly one of
 reason, or outside the supported profile by reason. Whatever a reply says, it is read by the deadline or it is
 `timeout`.
 
+In `block` (enforce with blocking only) an outcome also says whether the call is refused, and how (`refusal`): a
+check the server answered `BLOCKED` — 400; a call outside the supported profile, unless its type generates nothing a
+policy could block (`UNCHECKED_CALL_TYPES`) — 400; any bypass — 503, fail-closed. The glue raises it; the observer
+still never does.
+
 Logs carry the phase, the reason, a detail code, the HTTP status, the rule a refusal names and the guardrail's name —
 never a text, a key or an identifier of the user's call. A bypass of a call is logged at WARNING at most once a minute
 per phase and reason, with the number held back since; the counters have every one. A synthetic check's
@@ -27,7 +32,12 @@ import httpx
 from collieai_guardrail import __version__
 from collieai_guardrail.config import MAX_REPLY_BYTES, AdapterConfig, named
 from collieai_guardrail.counters import Counters
-from collieai_guardrail.eligibility import request_outside_reason, response_text
+from collieai_guardrail.eligibility import (
+    UNCHECKED_CALL_TYPES,
+    output_outside_reason,
+    request_outside_reason,
+    response_text,
+)
 from collieai_guardrail.payload import CallFacts, Sender, encode, post_call_payload, pre_call_payload
 from collieai_guardrail.transport import Failure, new_client, post_once
 from collieai_guardrail.verdict import Check, Rejected, error_detail, error_reason, parse_check
@@ -41,7 +51,9 @@ POST_CALL = "post_call"
 #: `guardrail_intervened`. One that found nothing where a rule did not run gave no full answer:
 #: `guardrail_failed_to_respond`, as a bypass. What was found comes first: a partial result that found something is
 #: flagged. A bypass is never `success`.
-GuardrailStatus = Literal["success", "guardrail_flagged", "guardrail_failed_to_respond", "not_run"]
+GuardrailStatus = Literal[
+    "success", "guardrail_flagged", "guardrail_failed_to_respond", "not_run", "guardrail_intervened"
+]
 GUARDRAIL_STATUS: dict[str, GuardrailStatus] = {
     "completed": "success",
     "bypass": "guardrail_failed_to_respond",
@@ -51,6 +63,14 @@ FLAGGED_STATUS: GuardrailStatus = "guardrail_flagged"
 DEGRADED_STATUS: GuardrailStatus = "guardrail_failed_to_respond"
 #: LiteLLM's `guardrail_action` of a completed check: the route's own action, never what Enforce would have done.
 GUARDRAIL_ACTION = "NONE"
+#: In `block`: a refused call's action, and its status — a block or an unsupported call is an intervention, a check
+#: that could not be made a failure to respond; the call is refused either way.
+BLOCKED_ACTION = "BLOCKED"
+INTERVENED_STATUS: GuardrailStatus = "guardrail_intervened"
+#: The code of each refusal, with the status the call is refused with.
+BLOCK_CODES = {PRE_CALL: "content_blocked", POST_CALL: "response_blocked"}
+UNSUPPORTED_CODES = {PRE_CALL: "unsupported_request", POST_CALL: "unsupported_response"}
+UNAVAILABLE_CODE = "guardrail_unavailable"
 WARNING_INTERVAL_S = 60.0
 
 
@@ -64,9 +84,13 @@ class Outcome:
     check: Check | None = None
     duration_s: float = 0.0
     rule_id: str | None = None  # the rule a refusal names
+    #: In `block`: the call is refused — (HTTP status, code); None when it goes on. Always None in Monitor.
+    refusal: tuple[int, str] | None = None
 
     @property
     def guardrail_status(self) -> GuardrailStatus:
+        if self.refusal is not None:
+            return DEGRADED_STATUS if self.result == "bypass" else INTERVENED_STATUS
         if self.check is not None and self.check.flagged:
             return FLAGGED_STATUS
         if self.check is not None and self.check.coverage_state == "degraded":
@@ -75,8 +99,10 @@ class Outcome:
 
     @property
     def guardrail_action(self) -> str | None:
-        """For LiteLLM's `guardrail_action`, which its logs keep unredacted: the route's action of a completed check;
-        None where no check was made."""
+        """For LiteLLM's `guardrail_action`, which its logs keep unredacted: `BLOCKED` for a refused call, the route's
+        action of a completed check otherwise; None where no check was made and the call goes on."""
+        if self.refusal is not None:
+            return BLOCKED_ACTION
         return GUARDRAIL_ACTION if self.check is not None else None
 
     @property
@@ -92,8 +118,10 @@ class Outcome:
             "adapter": "collieai-native",
             "phase": self.phase,
             "result": self.result,
-            "effective": "allow",
+            "effective": "allow" if self.refusal is None else "block",
         }
+        if self.refusal is not None:
+            out["refusal"] = self.refusal[1]
         if self.check is not None:
             out["would"] = self.check.would_outcome
             out["degraded"] = self.check.coverage_state == "degraded"
@@ -125,7 +153,12 @@ class Observer:
         self.name = name
         self._named = named(name)
         self.counters = counters if counters is not None else Counters()
-        self._sender = Sender(adapter_version=__version__, litellm_version=litellm_version, budget_ms=config.budget_ms)
+        self._sender = Sender(
+            adapter_version=__version__,
+            litellm_version=litellm_version,
+            budget_ms=config.budget_ms,
+            enforcement=config.enforcement_mode,
+        )
         # made here, not on the first call: two first calls at once would otherwise make two. httpx binds a client
         # to no event loop until it connects.
         self._client = client if client is not None else new_client()
@@ -149,10 +182,12 @@ class Observer:
         tally.add(PRE_CALL, "hook_calls")
         try:
             reason = request_outside_reason(request, call_type)
+            if reason is None and self.config.enforce:
+                reason = output_outside_reason(request)
         except Exception:
             reason = "malformed"
         if reason is not None:
-            return self._outside(tally, PRE_CALL, reason, started)
+            return self._outside(tally, PRE_CALL, reason, started, call_type=call_type)
         tally.add(PRE_CALL, "eligible")
         try:
             payload = pre_call_payload(request, self._sent_facts(facts), self._sender)
@@ -185,7 +220,7 @@ class Observer:
         except Exception:
             reason = "malformed"
         if reason is not None or text is None:
-            return self._outside(tally, POST_CALL, reason or "malformed", started)
+            return self._outside(tally, POST_CALL, reason or "malformed", started, call_type=call_type)
         tally.add(POST_CALL, "eligible")
         try:
             payload = post_call_payload(request, text, self._sent_facts(facts), self._sender)
@@ -223,7 +258,7 @@ class Observer:
         detail: str | None = None
         rule_id: str | None = None
         if sent.status == 200:
-            parsed = parse_check(sent.body, phase=phase)
+            parsed = parse_check(sent.body, phase=phase, enforce=self.config.enforce)
             detail = parsed.detail if isinstance(parsed, Rejected) else None
         elif 200 <= sent.status < 300:
             detail = "status"
@@ -236,18 +271,32 @@ class Observer:
         if not isinstance(parsed, Check):
             return self._bypass(tally, phase, reason, started, detail=detail, http_status=sent.status, rule_id=rule_id)
         tally.add(phase, "completed")
+        refusal = None
+        if parsed.blocked:
+            tally.add(phase, "blocked")
+            refusal = (400, BLOCK_CODES[phase])
         logger.debug("collieai guardrail %s: completed, coverage %s", phase, parsed.coverage_state)
-        return Outcome(phase, "completed", check=parsed, http_status=200, duration_s=loop.time() - started)
+        return Outcome(
+            phase, "completed", check=parsed, http_status=200, duration_s=loop.time() - started, refusal=refusal
+        )
 
     def _cancelled(self, tally: Counters, phase: str) -> None:
         # the caller's own cancellation, not a fault of the adapter or the server: counted, never warned about
         tally.add_reason(phase, "bypass", "cancelled")
         logger.debug("collieai guardrail %s: the call was cancelled during the check", phase)
 
-    def _outside(self, tally: Counters, phase: str, reason: str, started: float) -> Outcome:
+    def _outside(
+        self, tally: Counters, phase: str, reason: str, started: float, *, call_type: str | None = None
+    ) -> Outcome:
         tally.add_reason(phase, "outside", reason)
+        refusal = None
+        if self.config.enforce and call_type not in UNCHECKED_CALL_TYPES:
+            refusal = (400, UNSUPPORTED_CODES[phase])
+            tally.add_reason(phase, "refused", refusal[1])
         logger.debug("collieai guardrail %s: outside the supported profile (%s), not sent", phase, reason)
-        return Outcome(phase, "outside", reason=reason, duration_s=asyncio.get_running_loop().time() - started)
+        return Outcome(
+            phase, "outside", reason=reason, duration_s=asyncio.get_running_loop().time() - started, refusal=refusal
+        )
 
     def _bypass(
         self,
@@ -261,6 +310,9 @@ class Observer:
         rule_id: str | None = None,
     ) -> Outcome:
         tally.add_reason(phase, "bypass", reason)
+        refusal = (503, UNAVAILABLE_CODE) if self.config.enforce else None
+        if refusal is not None:
+            tally.add_reason(phase, "refused", UNAVAILABLE_CODE)
         if tally is self.counters:  # a call's; a synthetic check counts apart, and the heartbeat reports it
             self._warn(phase, reason, detail, http_status, rule_id)
         return Outcome(
@@ -271,6 +323,7 @@ class Observer:
             http_status=http_status,
             duration_s=asyncio.get_running_loop().time() - started,
             rule_id=rule_id,
+            refusal=refusal,
         )
 
     def _warn(self, phase: str, reason: str, detail: str | None, http_status: int | None, rule_id: str | None) -> None:
@@ -281,13 +334,14 @@ class Observer:
             return
         self._warned[(phase, reason)] = (now, 0)
         logger.warning(
-            "collieai guardrail %s: observation bypassed (%s, detail=%s, http_status=%s, rule_id=%s); the call goes on"
-            " unchanged (%d more held back since the last warning)%s",
+            "collieai guardrail %s: observation bypassed (%s, detail=%s, http_status=%s, rule_id=%s); %s"
+            " (%d more held back since the last warning)%s",
             phase,
             reason,
             detail,
             http_status,
             rule_id,
+            "the call is refused (enforcement_mode: block)" if self.config.enforce else "the call goes on unchanged",
             held,
             self._named,
         )

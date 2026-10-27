@@ -2,9 +2,12 @@
 
 A 200 is a completed check only when every condition of the strict parse holds; anything else is the `protocol`
 bypass, with the first condition that failed as its detail. A block or a rewrite in Monitor is a protocol error, not
-a decision: the adapter never acts on a reply. A non-2xx is a bypass named by the contract's table from its status
-and `error.type`; without a JSON body or without `error.type` it is `http_<class>`. Its detail is the server's
-`error.code`, and the rule a refusal names goes with it (`error_detail`).
+a decision: in Monitor the adapter never acts on a reply. In `block` (enforce with blocking only) a reply is `NONE`
+or `BLOCKED` from a server in `enforce` — a server that answers `monitor` would quietly lower the protection, so that
+is a protocol error too — and the adapter blocks only on the top-level `BLOCKED`, never on what a finding or `would`
+says. A non-2xx is a bypass named by the contract's table from its status and `error.type`; without a JSON body or
+without `error.type` it is `http_<class>`. Its detail is the server's `error.code`, and the rule a refusal names goes
+with it (`error_detail`).
 
 A check found something when one of its findings is a `detection` — the server names each finding's `kind`: a
 rule of the policy found what it looks for. A rule's `allow` and a detector that did
@@ -35,6 +38,8 @@ REPLACEMENT_KEYS = (
     "blocked_reason",
 )
 COVERAGE_STATES = ("clean", "degraded")
+#: A block stops the batch at the item that blocked, so the items after it are not judged.
+BLOCKED_COVERAGE_STATES = ("clean", "degraded", "incomplete")
 #: What Enforce would have done to the call where a check found something (`would.outcome`).
 FLAGGED_OUTCOMES = ("transform", "block")
 #: The stages the server times; no other name is kept.
@@ -124,6 +129,9 @@ class Check:
     flagged: bool
     diagnostics: dict[str, object]
     categories: tuple[str, ...] = ()
+    #: Enforce only: the server blocked the call — the top-level `BLOCKED` — and the rule that did.
+    blocked: bool = False
+    blocked_by: str | None = None
 
 
 @dataclass(frozen=True)
@@ -133,33 +141,39 @@ class Rejected:
     detail: str
 
 
-def parse_check(body: bytes, *, phase: str) -> Check | Rejected:
+def parse_check(body: bytes, *, phase: str, enforce: bool = False) -> Check | Rejected:
+    """`enforce` — the adapter asked for `block`."""
     try:
         reply = json.loads(body)
     except (ValueError, UnicodeDecodeError):
         return Rejected("not_json")
     if not isinstance(reply, dict):
         return Rejected("not_object")
-    if reply.get("action") != "NONE":
+    action = reply.get("action")
+    if action not in (("NONE", "BLOCKED") if enforce else ("NONE",)):
         return Rejected("action")
-    if any(key in reply for key in REPLACEMENT_KEYS):
+    blocked = action == "BLOCKED"
+    if any(key in reply for key in REPLACEMENT_KEYS if not (blocked and key == "blocked_reason")):
         return Rejected("replacement_key")
     collieai = reply.get("collieai")
     if not isinstance(collieai, dict):
         return Rejected("diagnostics_missing")
     if not _is_int(collieai.get("version")) or collieai.get("version") != 1:
         return Rejected("version")
-    if collieai.get("mode") != "monitor":
+    if collieai.get("mode") != ("enforce" if enforce else "monitor"):
         return Rejected("mode")
     if collieai.get("phase") != phase:
         return Rejected("phase")
-    if collieai.get("terminal") != "completed":
+    if collieai.get("terminal") != ("blocked" if blocked else "completed"):
         return Rejected("terminal")
     coverage = collieai.get("coverage")
-    if not isinstance(coverage, dict) or coverage.get("state") not in COVERAGE_STATES:
+    states = BLOCKED_COVERAGE_STATES if blocked else COVERAGE_STATES
+    if not isinstance(coverage, dict) or coverage.get("state") not in states:
         return Rejected("coverage_state")
     judged, total, rules_run = coverage.get("items_judged"), coverage.get("items_total"), coverage.get("rules_run")
-    if not (_is_int(judged) and _is_int(total) and judged == total and total >= 1):
+    if not (
+        _is_int(judged) and _is_int(total) and total >= 1 and (1 <= judged <= total if blocked else judged == total)
+    ):
         return Rejected("items")
     if not isinstance(rules_run, list) or len(rules_run) != total:
         return Rejected("rules_run")
@@ -170,8 +184,14 @@ def parse_check(body: bytes, *, phase: str) -> Check | Rejected:
         return Rejected("evaluation_id")
     findings = _findings(collieai.get("items"))
     named = ["kind" in finding for finding in findings]
-    if any(named) and not (all(named) and all(finding["kind"] in FINDING_KINDS for finding in findings)):
+    if (any(named) or enforce) and not (all(named) and all(finding["kind"] in FINDING_KINDS for finding in findings)):
         return Rejected("finding_kind")
+    blocked_by: str | None = None
+    if blocked:
+        acting = [f for f in findings if f.get("action") == "block" and f.get("mode") == "enforce"]
+        if not acting:
+            return Rejected("block_finding")
+        blocked_by = _str_or_none(acting[0].get("rule_id"))
     diagnostics = _diagnostics(collieai)
     kept_would = diagnostics.get("would")
     would: dict[str, object] = kept_would if isinstance(kept_would, dict) else {}
@@ -191,6 +211,8 @@ def parse_check(body: bytes, *, phase: str) -> Check | Rejected:
         flagged=flagged,
         diagnostics=diagnostics,
         categories=categories,
+        blocked=blocked,
+        blocked_by=blocked_by,
     )
 
 
@@ -308,7 +330,15 @@ def _item(item: Mapping[str, object]) -> dict[str, object]:
         "source": _str_or_none(item.get("source")),
         "outcome": _str_or_none(item.get("outcome")),
         "findings": [
-            {key: _str_or_none(finding.get(key)) for key in ("rule_id", "rule_type", "action", "mode", "kind")}
+            {
+                **{key: _str_or_none(finding.get(key)) for key in ("rule_id", "rule_type", "action", "mode", "kind")},
+                # An enforce reply says why a finding did not act — a mask is observed (`surface_mask_unsupported`).
+                **(
+                    {"no_enforce_reason": _str_or_none(finding.get("no_enforce_reason"))}
+                    if "no_enforce_reason" in finding
+                    else {}
+                ),
+            }
             for finding in (findings if isinstance(findings, list) else [])
             if isinstance(finding, Mapping)
         ],

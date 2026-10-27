@@ -41,6 +41,9 @@ KEY_VARIABLE = "COLLIEAI_API_KEY"
 UNSET_KEY_VALUES = (None, "", "None")
 #: The longest guardrail name the adapter repeats in its log.
 MAX_NAME_CHARS = 128
+#: `monitor` observes and never changes a call; `block` refuses a call the CollieAi policy blocks, and one the adapter
+#: could not check — enforce with blocking only, a pilot: no readiness gate of the proxy's workers yet.
+ENFORCEMENT_MODES = ("monitor", "block")
 
 
 class ConfigError(Exception):
@@ -64,6 +67,8 @@ class AdapterConfig:
     summary_interval_s: int = DEFAULT_SUMMARY_INTERVAL_S
     #: A synthetic pre- and post-call observation runs at start and then this often; 0 turns it off.
     synthetic_interval_s: int = DEFAULT_SYNTHETIC_INTERVAL_S
+    #: `monitor` (the default) or `block` — enforce with blocking only.
+    enforcement_mode: str = "monitor"
 
     def __post_init__(self) -> None:
         if not isinstance(self.api_base, str):
@@ -100,6 +105,12 @@ class AdapterConfig:
             raise ConfigError("forward_conversation_id must be true or false")
         _int_in("summary_interval_s", self.summary_interval_s, 1, 3600)
         _int_in("synthetic_interval_s", self.synthetic_interval_s, 0, 86_400)
+        if self.enforcement_mode not in ENFORCEMENT_MODES:
+            raise ConfigError("enforcement_mode must be monitor or block")
+
+    @property
+    def enforce(self) -> bool:
+        return self.enforcement_mode == "block"
 
     @property
     def url(self) -> str:

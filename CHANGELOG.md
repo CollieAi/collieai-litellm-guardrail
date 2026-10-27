@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.3.0 — 2026-10-27
+
+- Tested with LiteLLM 1.106.4 as well as 1.102.4.
+- `enforcement_mode: block`, a pilot: the adapter refuses a call the
+  CollieAi policy blocks (`400`, `content_blocked` before the model,
+  `response_blocked` after it), a call it could not check (`503`,
+  `guardrail_unavailable`), and a call outside what it checks (`400`,
+  `unsupported_request` / `unsupported_response`) unless it is an
+  embedding, rerank or moderation call. LiteLLM records a block as
+  `guardrail_intervened` with `guardrail_action: "BLOCKED"`. It needs
+  `mode: [pre_call, post_call]`, `default_on: true`, a CollieAi host that
+  allows blocking and an Enforce policy. Masks only observe in this mode.
+  `monitor`, the default, is unchanged.
+- The summary counts blocks (`blocked`) and refused calls by code
+  (`refused`).
+
 ## 0.2.0 — 2026-10-25
 
 What a check found is now visible in LiteLLM, also where LiteLLM redacts the

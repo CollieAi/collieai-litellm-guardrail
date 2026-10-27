@@ -37,6 +37,8 @@ class Sender:
     adapter_version: str
     litellm_version: str | None
     budget_ms: int
+    #: `block` asks the server for enforce with blocking only; a Monitor request does not name it.
+    enforcement: str = "monitor"
 
 
 def pre_call_payload(request: Mapping[str, object], facts: CallFacts, sender: Sender) -> dict[str, object]:
@@ -67,24 +69,25 @@ def _n(request: Mapping[str, object]) -> int:
 
 
 def _common(facts: CallFacts, sender: Sender, *, stream: bool, n: int) -> dict[str, object]:
+    collieai: dict[str, object] = {
+        "contract_version": CONTRACT_VERSION,
+        "adapter": "native",
+        "adapter_version": sender.adapter_version,
+        "operation_id": facts.operation_id,
+        "source_endpoint": "chat_completions",
+        "budget_ms": sender.budget_ms,
+        "stream": stream,
+        "n": n,
+    }
+    if sender.enforcement == "block":
+        collieai["enforcement"] = "block"
     common: dict[str, object] = {
         "request_data": {},
         "litellm_call_id": facts.litellm_call_id,
         "litellm_trace_id": facts.litellm_trace_id,
         "model": facts.model,
         "litellm_version": sender.litellm_version,
-        "additional_provider_specific_params": {
-            "collieai": {
-                "contract_version": CONTRACT_VERSION,
-                "adapter": "native",
-                "adapter_version": sender.adapter_version,
-                "operation_id": facts.operation_id,
-                "source_endpoint": "chat_completions",
-                "budget_ms": sender.budget_ms,
-                "stream": stream,
-                "n": n,
-            }
-        },
+        "additional_provider_specific_params": {"collieai": collieai},
     }
     if facts.conversation_id:
         common["request_headers"] = {CONVERSATION_HEADER: facts.conversation_id}

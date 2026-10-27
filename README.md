@@ -6,18 +6,19 @@
 
 A [LiteLLM proxy](https://docs.litellm.ai/docs/simple_proxy) guardrail that
 checks each eligible chat call against your [CollieAi](https://collieai.io)
-policy, before and after the model call. It runs in **Monitor** mode: it
-never changes or blocks a call, and never delays one beyond its own
+policy, before and after the model call. By default it runs in **Monitor**
+mode: it never changes or blocks a call, and never delays one beyond its own
 deadline. What CollieAi found goes into LiteLLM's guardrail log and
-CollieAi's Logs. This release is a beta and only observes.
+CollieAi's Logs. A pilot **block** mode refuses the calls your policy
+blocks: see [Blocking (pilot)](#blocking-pilot).
 
 You need a CollieAi project and its API key (`clai_…`). Rule support is
 decided by CollieAi's server execution profile, not by this adapter: read
 [Your project's policy](#your-projects-policy) before you start.
 
-- **Tested with:** LiteLLM proxy 1.102.4, Python ≥ 3.11. Use 1.102.2 or later:
-  1.102.0 and 1.102.1 carry the critical advisory GHSA-7hp6-4w63-5g45.
-  Other LiteLLM versions are untested.
+- **Tested with:** LiteLLM proxy 1.102.4 and 1.106.4, Python ≥ 3.11. Use
+  1.102.2 or later: 1.102.0 and 1.102.1 carry the critical advisory
+  GHSA-7hp6-4w63-5g45. Other LiteLLM versions are untested.
 - **Depends on:** `httpx`, which LiteLLM already has. Nothing else.
 
 ## Install
@@ -38,7 +39,7 @@ RUN python3 -m ensurepip \
  && python3 -m pip install --no-cache-dir collieai-litellm-guardrail
 ```
 
-Checked with the `v1.102.4` and `v1.106.0` images.
+Checked with the `v1.102.4`, `v1.106.0` and `v1.106.4` images.
 
 ## Configure
 
@@ -65,6 +66,7 @@ guardrails:
 | `forward_conversation_id` | `false` | Forward the caller's `x-collieai-conversation-id` header, and only that header |
 | `summary_interval_s` | 60 | How often each worker logs its counts |
 | `synthetic_interval_s` | 300 | How often each worker runs the synthetic check; it also runs at start. `0` turns it off |
+| `enforcement_mode` | `monitor` | `monitor` observes only. `block` refuses the calls your policy blocks — a pilot, see [Blocking (pilot)](#blocking-pilot) |
 
 Keep `mode: [pre_call, post_call]` and `default_on: true`. Otherwise one
 phase, or the calls that don't name the guardrail, are not observed. The
@@ -90,18 +92,68 @@ start stops instead of running unobserved. Two cases stay LiteLLM's:
 - a misspelled setting is passed on like any other key, so the adapter
   doesn't see it and uses the default.
 
+## Blocking (pilot)
+
+With `enforcement_mode: block` the adapter refuses a call instead of only
+observing it. This is a pilot: run it on a test project, not on your
+users' traffic yet. The proxy's workers do not yet refuse traffic while the
+guardrail is not wired in them, so a worker whose guardrail failed to load
+lets calls through unchecked.
+
+```yaml
+      enforcement_mode: block
+```
+
+It needs `mode: [pre_call, post_call]` and `default_on: true`: without
+them the proxy does not start. The CollieAi host must allow blocking, and
+the project's active policy must be in **Enforce**; otherwise every check
+is refused and so is every call (`503`).
+
+| What happens | The client gets | LiteLLM's record |
+|---|---|---|
+| A rule of the policy blocks the request | `400`, `Request blocked by the CollieAi policy (content_blocked)`. The model is not called | `guardrail_intervened`, `guardrail_action: "BLOCKED"`, the rule types in `violation_categories` |
+| A rule blocks the model's reply | `400`, `Response blocked by the CollieAi policy (response_blocked)`. The model was called and its tokens are spent; its text is not sent | same |
+| The check could not be made: CollieAi unreachable, the deadline, `busy`, any error | `503`, `CollieAi guardrail unavailable (guardrail_unavailable)` | `guardrail_failed_to_respond`, `"BLOCKED"` |
+| A call outside what the adapter checks: streaming, tools, more than one choice, non-text input, audio or other non-text output asked of the model, reasoning, Responses, `/v1/messages`, pass-through routes, any other call type | `400`, `… (unsupported_request)` before the model; `(unsupported_response)` for a reply outside it | `guardrail_intervened`, `"BLOCKED"` |
+| Embeddings, rerank, moderation | passes unchecked | `not_run` |
+| Nothing blocks | the call goes on unchanged | as in Monitor |
+
+The text of a refusal is fixed: it never names a rule or carries your
+policy's block message. A `400` means do not retry; a `503` may be retried.
+A call refused as outside what the adapter checks has no categories; its
+code is in `guardrail_response.refusal` (`unsupported_request`), and the
+summary counts it under `refused`, apart from the policy's `blocked`.
+
+What does not block:
+- **Masks.** A rule whose action is `mask` only observes in this mode: the
+  text is not changed. Its finding shows as flagged, with the reason
+  `surface_mask_unsupported`. Switching a policy to Enforce does not make
+  its masks protect anything here; give the rule `block` if it must stop
+  the call.
+- **A rule left in Monitor** inside the Enforce policy observes, as in
+  CollieAi.
+- **A detector that failed** follows the rule's own setting: a rule set to
+  block on an error blocks (its finding is an operational failure, with no
+  category), one set to allow lets the call through.
+
+To go back to observing, set `enforcement_mode: monitor` and reload the
+proxy. Turning blocking off on the CollieAi side, or switching the policy
+to Monitor, refuses every call until you do.
+
 ## Your project's policy
 
 With CollieAi's `stage1a-monitor-all-v2` server profile, which
 app.collieai.io runs, the beta runs every message rule selected for the
 phase: Input rules for pre-call and Output rules for post-call. The adapter
-has no list of rule types to run. Rules still run only in Monitor, so a
-finding is reported but never changes the model request or response.
+has no list of rule types to run. In Monitor a finding is reported but
+never changes the model request or response; in block mode a rule's block
+refuses the call ([Blocking (pilot)](#blocking-pilot)).
 
 The server admits the complete selected policy before the first detector. If
 one configuration is unsafe for synchronous execution or needs input the
-adapter does not send, the phase is refused as a whole. The call goes on
-unchanged, and the phase is a bypass `capability`. Examples include:
+adapter does not send, the phase is refused as a whole. In Monitor the call
+goes on unchanged, and the phase is a bypass `capability`; in block mode the
+call is refused (`503`). Examples include:
 
 - an unbounded regex such as nested or variable repetition;
 - more than 16 rules for one direction, or more than 8 dictionary rules;
@@ -138,8 +190,11 @@ configuration is admitted by the server profile:
 ## What it checks
 
 It checks foreground, non-streaming Chat Completions text with one choice.
-Every other call passes through unchanged, is not sent, and is counted as
-outside the supported profile under one reason:
+Every other call is not sent and is counted as outside the supported profile
+under one reason. In Monitor it passes through unchanged; in block mode it is
+refused before the model (`400`), except embeddings, rerank and moderation,
+and so is a chat call that asks the model for audio or another output than
+text (`non_text_output`):
 
 | Reason | The call |
 |---|---|
@@ -155,7 +210,8 @@ outside the supported profile under one reason:
 Each phase of an eligible call makes **one** POST to CollieAi:
 - no retries and no redirects;
 - the reply is read within `deadline_ms`;
-- the call itself goes on unchanged whatever happens.
+- in Monitor the call itself goes on unchanged whatever happens; in block
+  mode it goes on only when CollieAi answered and nothing blocked.
 
 The phase ends one of two ways:
 - **completed:** CollieAi checked every item;
@@ -189,10 +245,11 @@ Only a `detection` flags the check.
 
 | Status | When |
 |---|---|
-| `guardrail_flagged` | The check found a `detection`, also when some rule did not run. The call still went through unchanged |
+| `guardrail_flagged` | The check found a `detection`, also when some rule did not run. The call still went through unchanged; in block mode, a detection that did not block — a mask, a rule left in Monitor |
 | `guardrail_failed_to_respond` | No `detection`, and some rule did not run (coverage `degraded`): no full answer. Or a bypass: no check |
 | `success` | No `detection`, and every rule that applies ran |
-| `not_run` | Outside the supported profile |
+| `not_run` | Outside the supported profile, and the call went through unchanged: in Monitor any such call, in block mode embeddings, rerank and moderation |
+| `guardrail_intervened` | Block mode: the call was refused — a rule blocked it, or it is outside the supported profile |
 
 A CollieAi server before 2026.10.23 names no kind. With it,
 `guardrail_flagged` means Enforce would mask or block, as in 0.1.0.
@@ -203,7 +260,7 @@ fields where its spend logs redact `guardrail_response`
 
 | Field | Completed check | Bypass, outside |
 |---|---|---|
-| `guardrail_action` | `"NONE"`: the route's own action. Monitor never acts, and this is not what Enforce would do | `null` |
+| `guardrail_action` | `"NONE"`: the route's own action. Monitor never acts, and this is not what Enforce would do. In block mode a refused call is `"BLOCKED"` | `null`; `"BLOCKED"` for a call block mode refused |
 | `violation_categories` | The rule types of the detections, unique and sorted, for example `["aho_corasick", "structured_id"]`. `null` when nothing was detected | `null` |
 
 A category is one of CollieAi's message rule types: `aho_corasick`,
@@ -213,7 +270,8 @@ A category is one of CollieAi's message rule types: `aho_corasick`,
 doesn't know is `other`. Rule names are never sent: you choose them.
 
 **`guardrail_response`** carries:
-- `result` and `effective`, which is always `allow`;
+- `result` and `effective`: `allow` — always in Monitor — or `block` for a
+  call block mode refused, with the refusal's code in `refusal`;
 - for a completed check: `would` (CollieAi's `would.outcome`: what Enforce
   of the current configuration would do; `none` in a Monitor policy),
   `degraded`, and CollieAi's diagnostics: evaluation ID, coverage with the
@@ -356,8 +414,9 @@ trigger it.
 - **Counts are per worker process**, and they reset when the worker restarts.
 - **A burst beyond CollieAi's capacity is `busy`.** Each CollieAi API
   process checks one call at a time and answers the next `busy`. The
-  adapter counts it as a bypass, and the call goes on unchanged. If the
-  summary shows a lasting `busy` share, tell CollieAi support.
+  adapter counts it as a bypass, and the call goes on unchanged — in block
+  mode it is refused (`503`). If the summary shows a lasting `busy` share,
+  tell CollieAi support.
 
 ## Turning it off
 

@@ -56,6 +56,10 @@ _OPERATION_SECRET = secrets.token_bytes(32)
 #: Where a LiteLLM log event keeps the request's metadata (`litellm_params`): `metadata`, or `litellm_metadata` on
 #: the routes that keep the proxy's there.
 _LOGGED_METADATA = ("metadata", "litellm_metadata")
+#: A refusal mark's reason: one of the closed outside reasons, or empty for an eligible call.
+_REASON_FORM = re.compile(r"[a-z_]{0,64}")
+#: Enforce: the mark a phase leaves when it refused the call (`mark_refused`), beside the operation's ID.
+_REFUSED_KEYS = {PRE_CALL: "collieai_pre_refused", POST_CALL: "collieai_post_refused"}
 
 
 def call_type_of(value: object) -> str | None:
@@ -125,6 +129,36 @@ def logged_operation_id(kwargs: Mapping[str, object]) -> str | None:
     return None
 
 
+def mark_refused(metadata: dict[str, object], phase: str, operation_id: str, reason: str | None) -> None:
+    """Enforce: this phase refused the call. LiteLLM logs it as a failure — before the model a call its proxy refused
+    (`rejected`), after it one that never succeeded — so the count takes the phase as seen, by `reason` (None: the
+    call was eligible), as it would have had the call gone on: else `logged_unseen` would drift by every refusal.
+    Tagged as the operation's ID is, so only a mark this process made is taken."""
+    value = reason or ""
+    metadata[_REFUSED_KEYS[phase]] = f"{value}:{_operation_tag(f'refused:{phase}:{operation_id}:{value}')}"
+
+
+def refused_by_us(kwargs: Mapping[str, object], phase: str, operation_id: str | None) -> tuple[str | None] | None:
+    """The mark `mark_refused` left on the call a LiteLLM log event is for: `(reason,)`, or None without one."""
+    if operation_id is None:
+        return None
+    params = kwargs.get("litellm_params")
+    if not isinstance(params, Mapping):
+        return None
+    for key in _LOGGED_METADATA:
+        metadata = params.get(key)
+        mark = metadata.get(_REFUSED_KEYS[phase]) if isinstance(metadata, Mapping) else None
+        if not isinstance(mark, str) or ":" not in mark:
+            continue
+        value, tag = mark.rsplit(":", 1)
+        if not _REASON_FORM.fullmatch(value):  # not a mark this process wrote: never tagged, never counted
+            continue
+        expected = _operation_tag(f"refused:{phase}:{operation_id}:{value}")
+        if OPERATION_ID_FORM.fullmatch(tag) and hmac.compare_digest(tag, expected):
+            return (value or None,)
+    return None
+
+
 def _operation_tag(operation_id: str) -> str:
     return hmac.new(_OPERATION_SECRET, operation_id.encode("ascii"), hashlib.sha256).hexdigest()[:32]
 
@@ -177,12 +211,17 @@ def count_logged(
     nothing else. An event without that ID is a call of its own: pre-call did not run for it, and a hook that did not
     run must show."""
     call_id = logged_operation_id(kwargs)
-    first, first_success = calls.see(call_id, succeeded=succeeded) if calls and call_id else (True, succeeded)
+    pre_refused = None if succeeded else refused_by_us(kwargs, PRE_CALL, call_id)
+    post_refused = None if succeeded else refused_by_us(kwargs, POST_CALL, call_id)
+    seen_post = succeeded or post_refused is not None
+    first, first_success = calls.see(call_id, succeeded=seen_post) if calls and call_id else (True, seen_post)
     if not first:
         counters.add(PRE_CALL, "logged_repeats")
     reason: str | None
     try:
-        if kwargs.get(NO_UPSTREAM_CALL):
+        if pre_refused is not None:  # our own refusal before the model, not another's
+            reason = pre_refused[0]
+        elif kwargs.get(NO_UPSTREAM_CALL):
             reason = REJECTED
         else:
             reason = request_outside_reason(logged_request(kwargs), call_type_of(kwargs.get("call_type")))
@@ -193,10 +232,13 @@ def count_logged(
     if not first_success:
         return
     if reason is None:
-        try:
-            _, reason = response_text(response)
-        except Exception:
-            reason = "malformed"
+        if post_refused is not None:  # refused after the model: the response never reached the log
+            reason = post_refused[0]
+        else:
+            try:
+                _, reason = response_text(response)
+            except Exception:
+                reason = "malformed"
     _count(counters, POST_CALL, reason)
 
 

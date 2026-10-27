@@ -344,9 +344,9 @@ async def test_a_reply_read_after_the_deadline_is_a_timeout_whatever_it_says(sta
 async def test_a_parse_that_ends_after_the_deadline_is_a_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     """The deadline covers the parse too, on every path of the reply — a refused 200 as well as a check."""
 
-    def slow_parse(body: bytes, *, phase: str) -> Any:
+    def slow_parse(body: bytes, *, phase: str, enforce: bool = False) -> Any:
         time.sleep(DEADLINE_MS / 1000 + 0.05)
-        return parse_check(body, phase=phase)
+        return parse_check(body, phase=phase, enforce=enforce)
 
     monkeypatch.setattr(observer_module, "parse_check", slow_parse)
     outcome = await _pre(_observer(MockServer(raw_reply(200, b"not json"))))

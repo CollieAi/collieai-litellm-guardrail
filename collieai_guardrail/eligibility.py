@@ -15,6 +15,11 @@ from collections.abc import Mapping, Sequence
 #: LiteLLM's call types of a Chat Completion (`CallTypesLiteral`); the proxy's chat route uses `acompletion`.
 CHAT_CALL_TYPES = frozenset({"acompletion", "completion"})
 
+#: In `block` the only calls that pass unchecked: they generate no text a policy could block. Every other call outside
+#: the profile — a stream, tools, Responses, Messages, a pass-through route, a type LiteLLM adds later — is refused
+#: before the model: else switching the endpoint, or streaming, would get past the policy.
+UNCHECKED_CALL_TYPES = frozenset({"aembedding", "embedding", "arerank", "rerank", "amoderation", "moderation"})
+
 #: The closed reasons a call is outside the supported profile.
 OUTSIDE_REASONS = (
     "call_type",  # not a Chat Completion: Responses, embeddings, images, a pass-through route...
@@ -64,6 +69,17 @@ def request_outside_reason(request: Mapping[str, object], call_type: str | None)
         reason = _message_outside_reason(message)
         if reason is not None:
             return reason
+    return None
+
+
+def output_outside_reason(request: Mapping[str, object]) -> str | None:
+    """Why the reply the request asks for could not be checked after the model — audio or another output than text —
+    or None. Only `block` reads it: a reply post-call cannot check must be refused before the model is called."""
+    modalities = request.get("modalities")
+    if request.get("audio") or (isinstance(modalities, list) and any(m != "text" for m in modalities)):
+        return "non_text_output"
+    if modalities is not None and not isinstance(modalities, list):
+        return "malformed"
     return None
 
 
