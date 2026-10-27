@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.1 — 2026-10-27
+
+- `enforcement_mode: block`: a refused call is counted in the summary's
+  `logged_*` counts once, when it is refused. LiteLLM logs a guardrail's
+  refusal differently by version (1.102.4 not at all, 1.106.4 as a call
+  its proxy refused), so in 0.3.0 `logged_unseen` went below zero by the
+  refused calls and a block after the model was counted as `rejected`.
+
 ## 0.3.0 — 2026-10-27
 
 - Tested with LiteLLM 1.106.4 as well as 1.102.4.

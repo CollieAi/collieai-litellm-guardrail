@@ -63,12 +63,14 @@ from collieai_guardrail.config import (
     named,
 )
 from collieai_guardrail.counters import Counters
+from collieai_guardrail.eligibility import request_outside_reason
 from collieai_guardrail.heartbeat import Heartbeat
 from collieai_guardrail.litellm_data import (
     LoggedCalls,
     call_facts,
     call_type_of,
     count_logged,
+    count_refused,
     issue_operation_id,
     issued_operation_id,
     mark_refused,
@@ -166,7 +168,7 @@ class CollieAIGuardrail(CustomGuardrail):
             outcome = await self.observer.observe_request(data, call_type=call_type_of(call_type), facts=facts)
             self._record(data, outcome, GuardrailEventHooks.pre_call, started, operation_id)
             if outcome.refusal is not None:
-                mark_refused(_metadata(data), PRE_CALL, operation_id, _counted_reason(outcome))
+                self._mark_refused(PRE_CALL, data, operation_id, outcome)
         except Exception as error:  # a cancellation goes on; nothing else reaches LiteLLM
             self._glue_failed(PRE_CALL, error, data, outcome)
             return None
@@ -178,6 +180,7 @@ class CollieAIGuardrail(CustomGuardrail):
     ) -> None:
         self.heartbeat.ensure_running()
         outcome: Outcome | None = None
+        call_type: str | None = None
         try:
             started = time.time()
             operation_id = _operation_id(data)
@@ -186,14 +189,22 @@ class CollieAIGuardrail(CustomGuardrail):
             outcome = await self.observer.observe_response(data, response, call_type=call_type, facts=facts)
             self._record(data, outcome, GuardrailEventHooks.post_call, started, operation_id)
             if outcome.refusal is not None:
-                mark_refused(_metadata(data), POST_CALL, operation_id, _counted_reason(outcome))
+                self._mark_refused(POST_CALL, data, operation_id, outcome, call_type=call_type)
         except Exception as error:
-            self._glue_failed(POST_CALL, error, data, outcome)
+            self._glue_failed(POST_CALL, error, data, outcome, call_type=call_type)
             return None
         self._refuse_if_asked(outcome)
         return None
 
-    def _glue_failed(self, phase: str, error: Exception, data: dict[str, object], outcome: Outcome | None) -> None:
+    def _glue_failed(
+        self,
+        phase: str,
+        error: Exception,
+        data: dict[str, object],
+        outcome: Outcome | None,
+        *,
+        call_type: str | None = None,
+    ) -> None:
         """A fault of the glue itself: in Monitor the call goes on; in block it is refused, as a check not made — with
         its mark when the call has its ID, so the count still sees it under the reason the outcome had, if any."""
         logger.warning(
@@ -207,10 +218,32 @@ class CollieAIGuardrail(CustomGuardrail):
             try:
                 operation_id = issued_operation_id(_metadata(data))
                 if operation_id is not None:
-                    mark_refused(_metadata(data), phase, operation_id, _counted_reason(outcome))
+                    self._mark_refused(phase, data, operation_id, outcome, call_type=call_type)
             except Exception:  # the refusal stands; only the count may miss it
                 pass
             raise self._refusal(503, UNAVAILABLE_CODE, blocked_content=False) from None
+
+    def _mark_refused(
+        self,
+        phase: str,
+        data: dict[str, object],
+        operation_id: str,
+        outcome: Outcome | None,
+        *,
+        call_type: str | None = None,
+    ) -> None:
+        """The refusal's mark, and its count now: LiteLLM's event about it, if one comes, is skipped."""
+        reason = _counted_reason(outcome)
+        mark_refused(_metadata(data), phase, operation_id, reason)
+        request_reason = request_outside_reason(data, call_type) if phase == POST_CALL else None
+        count_refused(
+            self.counters,
+            phase,
+            reason,
+            operation_id=operation_id,
+            request_reason=request_reason,
+            calls=self._logged_calls,
+        )
 
     def _refuse_if_asked(self, outcome: Outcome) -> None:
         """Block only: refuse the call as the outcome says, after it was recorded. Never in Monitor."""

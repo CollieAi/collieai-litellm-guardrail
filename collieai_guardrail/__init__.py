@@ -9,4 +9,4 @@ are in the supported profile), `payload` (the request), `transport` (one POST un
 litellm.
 """
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
