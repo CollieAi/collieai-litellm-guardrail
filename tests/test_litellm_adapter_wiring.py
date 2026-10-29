@@ -409,7 +409,8 @@ def test_each_guardrails_summary_names_it(caplog: pytest.LogCaptureFixture) -> N
 
 def test_every_line_an_instance_logs_ends_with_its_guardrails_name() -> None:
     """Each WARNING and INFO of the glue, the heartbeat and the observer passes the name's tail as
-    its last argument, the summary aside, whose JSON carries the name. A line added without it fails here."""
+    its last argument, the summary aside, whose JSON carries the name — the readiness guard's ERROR its own name's.
+    A line added without it fails here."""
     package = Path(__file__).resolve().parent.parent / "collieai_guardrail"
     lines = 0
     for module in ("guardrail.py", "heartbeat.py", "observer.py"):
@@ -431,7 +432,7 @@ def test_every_line_an_instance_logs_ends_with_its_guardrails_name() -> None:
             assert text.value.endswith("%s") and isinstance(last, ast.Attribute) and last.attr == "_named", (
                 f"{module}:{node.lineno}"
             )
-    assert lines == 14
+    assert lines == 15
 
 
 @pytest.mark.parametrize(

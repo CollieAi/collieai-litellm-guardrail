@@ -42,9 +42,12 @@ glue need LiteLLM installed.
 
 ## Behavior changes
 
-The guardrail never changes a call: whatever happens to a check, the request
-and the response pass through as they are. A change in behavior is accepted
-only with tests, and must keep that promise.
+In Monitor, the default, the guardrail never changes a call: whatever
+happens to a check, the request and the response pass through as they are.
+In block mode it refuses a call only as the README says: a block of the
+policy, a call outside what it checks, or a check it could not make. A
+change in behavior is accepted only with tests, and must keep both
+promises.
 
 ## Commit messages
 

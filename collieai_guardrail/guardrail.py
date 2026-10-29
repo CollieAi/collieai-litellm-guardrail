@@ -25,7 +25,9 @@ With `enforcement_mode: block` (enforce with blocking only) a hook refuses the c
 (`Outcome.refusal`): it records the phase first, then raises
 LiteLLM's `GuardrailRaisedException` with the status — 400 for a block or a call outside what the adapter checks
 (nothing reaches the model before the call; the model's text never reaches the client after it), 503 when the
-check could not be made. A fault of the glue itself refuses the call too. Block needs both phases and `default_on`.
+check could not be made. A fault of the glue itself refuses the call too. Block needs both phases, `default_on` and
+the readiness guard among the proxy's callbacks (`RequireGuardrail`), which refuses every call while no CollieAi
+guardrail is loaded.
 
 A setting the adapter cannot run with stops the proxy's start (`ConfigError`), `mode` included whatever
 LITELLM_STRICT_GUARDRAIL_MODES says. Past that, in Monitor nothing here raises into LiteLLM but a cancellation of the
@@ -46,6 +48,7 @@ import httpx
 import litellm
 from litellm.exceptions import GuardrailRaisedException
 from litellm.integrations.custom_guardrail import CustomGuardrail
+from litellm.integrations.custom_logger import CustomLogger
 from litellm.litellm_core_utils.api_route_to_call_types import get_call_types_for_route
 from litellm.litellm_core_utils.core_helpers import get_or_create_metadata_bucket
 from litellm.types.guardrails import GuardrailEventHooks, Mode
@@ -92,9 +95,18 @@ REFUSAL_MESSAGES = {
     "unsupported_response": "Response outside what the CollieAi guardrail checks",
     UNAVAILABLE_CODE: "CollieAi guardrail unavailable",
 }
+NOT_LOADED_CODE = "guardrail_not_loaded"
+#: The readiness guard as `litellm_settings.callbacks` names it.
+GUARD_PATH = "collieai_guardrail.guardrail.require_guardrail"
+#: The name LiteLLM's record of a call the guard refused gives it.
+GUARD_NAME = "collieai-readiness"
+#: The least time between two of the guard's ERROR lines in one worker.
+GUARD_LOG_INTERVAL_S = 60.0
 
 
 class CollieAIGuardrail(CustomGuardrail):
+    _collieai_kind = "guardrail"  # what `_is_collieai` knows it by
+
     def __init__(
         self,
         *,
@@ -128,6 +140,7 @@ class CollieAIGuardrail(CustomGuardrail):
             _check_mode(kwargs.get("event_hook"))
             if self.config.enforce:
                 _check_enforce_wiring(kwargs.get("event_hook"), kwargs.get("default_on"))
+                _check_guard()
             super().__init__(supported_event_hooks=list(HOOKS), **kwargs)
         except (ValueError, TypeError) as error:  # LiteLLM's loader would swallow it and start without the guardrail
             raise ConfigError(f"the guardrail's settings were refused ({type(error).__name__})") from error
@@ -153,6 +166,16 @@ class CollieAIGuardrail(CustomGuardrail):
         )
         self._warn_about_wiring()
         self.heartbeat.ensure_running()
+
+    def apply_stream_scope(self, stream_scope: object) -> None:
+        """LiteLLM's `stream_scope` (1.106; 1.102 has none) runs a phase only for streaming calls, or only for the
+        others: in block the rest would go through unchecked, so block starts only without one or with `both`. LiteLLM
+        applies it to the guardrail it has built, and calls this from its constructor too."""
+        if self.config.enforce and stream_scope not in (None, "both"):
+            raise ConfigError("enforcement_mode block needs stream_scope unset or both")
+        apply = getattr(super(), "apply_stream_scope", None)
+        if apply is not None:
+            apply(stream_scope)
 
     # ------------------------------------------------------------------ the hooks
 
@@ -338,6 +361,69 @@ class CollieAIGuardrail(CustomGuardrail):
             )
 
 
+class RequireGuardrail(CustomLogger):
+    """The readiness guard for `enforcement_mode: block`, one line in the proxy's config:
+
+        litellm_settings:
+          callbacks: ["collieai_guardrail.guardrail.require_guardrail"]
+
+    LiteLLM starts without a guardrail whose entry it refuses — a missing `mode`, a value of the wrong type:
+    `init_guardrails_v2` logs "Skipping guardrail" and goes on, and calls go through unchecked. Its checks of the entry
+    fail before it builds the guardrail, so the guardrail cannot stop that start. The guard can: LiteLLM loads the
+    callbacks before the guardrails and does not swallow an error loading them. It refuses every call (503
+    `guardrail_not_loaded`) while the worker has no CollieAi guardrail in block among its callbacks, and the guardrail
+    in block does not start without it (`_check_guard`), so a mistake in the entry refuses the calls instead.
+
+    Only a guardrail in block counts. A misspelled `enforcement_mode` key reaches the adapter as an unknown setting and
+    leaves it in Monitor; the guard refuses then too, instead of the proxy observing quietly. Going back to Monitor
+    takes the guard's line out as well. The guard reads no request and sends nothing."""
+
+    _collieai_kind = "readiness"  # what `_is_collieai` knows it by
+    # LiteLLM runs a plain callback's pre-call hook in its guardrail-only scans (a batch file's records; the MCP tool
+    # catalog in 1.106) only when the callback says it judges the request.
+    enforces_request_content = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._named = named(GUARD_NAME)
+        self._reported_at: float | None = None
+
+    async def async_pre_call_hook(
+        self, user_api_key_dict: object, cache: object, data: dict[str, object], call_type: object
+    ) -> None:
+        if any(
+            _is_collieai(callback, "guardrail") and getattr(callback, "enforce", False) is True
+            for callback in litellm.callbacks
+        ):
+            return None
+        self._report()
+        raise GuardrailRaisedException(
+            guardrail_name=GUARD_NAME,
+            message=f"CollieAi guardrail not loaded ({NOT_LOADED_CODE})",
+            should_wrap_with_default_message=False,
+            status_code=503,
+        )
+
+    def _report(self) -> None:
+        now = time.monotonic()
+        if self._reported_at is not None and now - self._reported_at < GUARD_LOG_INTERVAL_S:
+            return
+        self._reported_at = now
+        _make_visible(logger)  # no guardrail may have been built in this worker to do it
+        logger.error(
+            "collieai guardrail readiness: no CollieAi guardrail in enforcement_mode block is loaded in this worker;"
+            " every call is refused (503 %s). LiteLLM logs a guardrail it skips at the start ('Skipping guardrail');"
+            " to go back to Monitor, take %s out of litellm_settings.callbacks as well%s",
+            NOT_LOADED_CODE,
+            GUARD_PATH,
+            self._named,
+        )
+
+
+#: The instance `litellm_settings.callbacks` names (`GUARD_PATH`).
+require_guardrail = RequireGuardrail()
+
+
 def _counted_reason(outcome: Outcome | None) -> str | None:
     """The reason the count takes a refused phase under: an outside call's, None for an eligible one."""
     return outcome.reason if outcome is not None and outcome.result == "outside" else None
@@ -404,11 +490,30 @@ def _check_mode(event_hook: object) -> None:
 
 def _check_enforce_wiring(event_hook: object, default_on: object) -> None:
     """Block refuses what it could not check, so a phase it does not see, or a request that does not name the
-    guardrail, would go through unchecked: both phases and `default_on: true` or the proxy does not start."""
+    guardrail, would go through unchecked: both phases and `default_on: true` or the proxy does not start. A mode by
+    tags runs a phase only for the tags it names, and a request's tags are the caller's to send: not in block."""
+    if isinstance(event_hook, Mode):
+        raise ConfigError("enforcement_mode block needs mode: [pre_call, post_call], not a mode by tags")
     if _hooks(event_hook) != set(OUR_HOOKS):
         raise ConfigError("enforcement_mode block needs mode: [pre_call, post_call]")
     if default_on is not True:
         raise ConfigError("enforcement_mode block needs default_on: true")
+
+
+def _is_collieai(callback: object, kind: str) -> bool:
+    """The guardrail or the guard by its class's mark, not `isinstance`: LiteLLM loads a module that sits next to its
+    config by its file path, so the two may come from two copies of this module."""
+    return getattr(type(callback), "_collieai_kind", None) == kind
+
+
+def _check_guard() -> None:
+    """Block also needs the readiness guard among the proxy's callbacks (`RequireGuardrail`): without it, an entry
+    LiteLLM refuses before building the guardrail would leave every call unchecked. LiteLLM loads the callbacks
+    first."""
+    if not any(_is_collieai(callback, "readiness") for callback in litellm.callbacks):
+        raise ConfigError(
+            f'enforcement_mode block needs the readiness guard: add "{GUARD_PATH}" to litellm_settings.callbacks'
+        )
 
 
 def _hooks(event_hook: object) -> set[str]:

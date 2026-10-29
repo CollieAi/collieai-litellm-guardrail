@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.0.0 — 2026-10-29
+
+- Block mode is no longer a pilot. The README gives app.collieai.io's
+  capacity in block — up to 8 checks a second with the Starter policy —
+  and what a call gets past it.
+- `enforcement_mode: block` does not start with a mode by tags, or with a
+  LiteLLM `stream_scope` other than `both` (LiteLLM 1.106): each runs a
+  phase only for some calls, and the others went through unchecked.
+- In block mode a request over the limits CollieAi checks, or of a text
+  shape it doesn't take (bypass `limit`, `shape`), is refused with `400`
+  `unsupported_request` (`unsupported_response` for the model's reply)
+  instead of `503`: the same call is refused again, so it is not one to
+  retry. LiteLLM's record is `guardrail_intervened`.
+- `enforcement_mode: block` needs the readiness guard,
+  `collieai_guardrail.guardrail.require_guardrail`, in
+  `litellm_settings.callbacks` (or `require_guardrail` in
+  `litellm.callbacks` where you embed the adapter); without it the proxy
+  does not start. The guard refuses every call
+  (`503 guardrail_not_loaded`) while the worker has no CollieAi guardrail
+  in block mode. Before, LiteLLM started without a guardrail whose entry
+  it refused (no `mode`, a value of the wrong type), and a misspelled
+  `enforcement_mode` left the adapter in Monitor: both let calls through
+  unchecked.
+- Tested with LiteLLM 1.106.5 too.
+
 ## 0.3.1 — 2026-10-27
 
 - `enforcement_mode: block`: a refused call is counted in the summary's

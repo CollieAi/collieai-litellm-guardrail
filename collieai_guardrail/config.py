@@ -42,7 +42,7 @@ UNSET_KEY_VALUES = (None, "", "None")
 #: The longest guardrail name the adapter repeats in its log.
 MAX_NAME_CHARS = 128
 #: `monitor` observes and never changes a call; `block` refuses a call the CollieAi policy blocks, and one the adapter
-#: could not check — enforce with blocking only, a pilot: no readiness gate of the proxy's workers yet.
+#: could not check — enforce with blocking only, with the readiness guard on every call (`require_guardrail`).
 ENFORCEMENT_MODES = ("monitor", "block")
 
 

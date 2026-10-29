@@ -16,8 +16,8 @@ from dataclasses import dataclass
 
 import httpx
 
-#: The pool: the server evaluates one call at a time per worker and answers a busy worker at
-#: once, so a deep pool only queues work the deadline would cancel.
+#: The pool: the server evaluates one call at a time per worker and answers `busy` after a short
+#: wait for it, so a deep pool only queues work the deadline would cancel.
 POOL_LIMITS = httpx.Limits(max_connections=64, max_keepalive_connections=16)
 
 
