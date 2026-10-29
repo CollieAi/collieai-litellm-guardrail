@@ -99,6 +99,45 @@ def check_reply(phase: str = "pre_call", items: int = 3, *, found: bool = True) 
     }
 
 
+def enforce_reply(phase: str = "pre_call", items: int = 3, *, blocked: bool = False) -> dict[str, Any]:
+    """The route's enforce reply: `NONE` in `enforce`, or `BLOCKED` stopped at the first item."""
+    reply = check_reply(phase, items, found=False)
+    collieai = reply["collieai"]
+    collieai["mode"] = "enforce"
+    if not blocked:
+        return reply
+    reply["action"] = "BLOCKED"
+    reply["blocked_reason"] = "Request blocked by the CollieAi policy"
+    collieai["terminal"] = "blocked"
+    collieai["coverage"].update(state="incomplete", items_judged=1)
+    collieai["items"] = [
+        {
+            "index": 0,
+            "source": "structured_messages[0].content",
+            "outcome": "block",
+            "findings": [
+                {
+                    "rule_id": "rule-b",
+                    "rule_type": "aho_corasick",
+                    "action": "block",
+                    "mode": "enforce",
+                    "kind": "detection",
+                    "no_enforce_reason": None,
+                },
+                {
+                    "rule_id": "rule-m",
+                    "rule_type": "structured_id",
+                    "action": "mask",
+                    "mode": "monitor",
+                    "kind": "detection",
+                    "no_enforce_reason": "surface_mask_unsupported",
+                },
+            ],
+        }
+    ]
+    return reply
+
+
 def legacy_reply(phase: str = "pre_call", items: int = 3) -> dict[str, Any]:
     """The example as a server before finding kinds (2026.10.23) serializes it: no finding names its `kind`."""
     reply = check_reply(phase, items)

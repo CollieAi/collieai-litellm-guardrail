@@ -8,7 +8,7 @@ build-backend = "hatchling.build"
 [project]
 name = "collieai-litellm-guardrail"
 dynamic = ["version"]
-description = "CollieAi guardrail for the LiteLLM proxy: checks every chat completion against your CollieAi policy, in Monitor mode."
+description = "CollieAi guardrail for the LiteLLM proxy: checks every chat completion against your CollieAi policy, observing it or blocking what the policy blocks."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -17,7 +17,7 @@ authors = [{ name = "CollieAi", email = "sdk@collieai.io" }]
 keywords = ["litellm", "guardrails", "ai-guardrails", "llm-security", "llm-firewall", "llm-gateway", "monitoring"]
 # No license classifier: the SPDX `license` expression above is the license field (PEP 639).
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "Intended Audience :: System Administrators",
     "Programming Language :: Python :: 3",

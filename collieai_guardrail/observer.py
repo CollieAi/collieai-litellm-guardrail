@@ -9,7 +9,8 @@ reason, or outside the supported profile by reason. Whatever a reply says, it is
 
 In `block` (enforce with blocking only) an outcome also says whether the call is refused, and how (`refusal`): a
 check the server answered `BLOCKED` — 400; a call outside the supported profile, unless its type generates nothing a
-policy could block (`UNCHECKED_CALL_TYPES`) — 400; any bypass — 503, fail-closed. The glue raises it; the observer
+policy could block (`UNCHECKED_CALL_TYPES`) — 400; a bypass the request itself causes (`REQUEST_REASONS`) — 400 as
+outside, since the same call meets it again; any other bypass — 503, fail-closed. The glue raises it; the observer
 still never does.
 
 Logs carry the phase, the reason, a detail code, the HTTP status, the rule a refusal names and the guardrail's name —
@@ -71,6 +72,9 @@ INTERVENED_STATUS: GuardrailStatus = "guardrail_intervened"
 BLOCK_CODES = {PRE_CALL: "content_blocked", POST_CALL: "response_blocked"}
 UNSUPPORTED_CODES = {PRE_CALL: "unsupported_request", POST_CALL: "unsupported_response"}
 UNAVAILABLE_CODE = "guardrail_unavailable"
+#: Bypass reasons of the request itself — over the profile's limits, or a text shape it does not take: the same call
+#: meets them again, so block refuses it as outside what the adapter checks, not as a check that may be retried.
+REQUEST_REASONS = frozenset({"limit", "shape"})
 WARNING_INTERVAL_S = 60.0
 
 
@@ -90,7 +94,7 @@ class Outcome:
     @property
     def guardrail_status(self) -> GuardrailStatus:
         if self.refusal is not None:
-            return DEGRADED_STATUS if self.result == "bypass" else INTERVENED_STATUS
+            return DEGRADED_STATUS if self.refusal[1] == UNAVAILABLE_CODE else INTERVENED_STATUS
         if self.check is not None and self.check.flagged:
             return FLAGGED_STATUS
         if self.check is not None and self.check.coverage_state == "degraded":
@@ -310,9 +314,10 @@ class Observer:
         rule_id: str | None = None,
     ) -> Outcome:
         tally.add_reason(phase, "bypass", reason)
-        refusal = (503, UNAVAILABLE_CODE) if self.config.enforce else None
-        if refusal is not None:
-            tally.add_reason(phase, "refused", UNAVAILABLE_CODE)
+        refusal = None
+        if self.config.enforce:
+            refusal = (400, UNSUPPORTED_CODES[phase]) if reason in REQUEST_REASONS else (503, UNAVAILABLE_CODE)
+            tally.add_reason(phase, "refused", refusal[1])
         if tally is self.counters:  # a call's; a synthetic check counts apart, and the heartbeat reports it
             self._warn(phase, reason, detail, http_status, rule_id)
         return Outcome(

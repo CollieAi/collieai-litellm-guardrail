@@ -9,16 +9,16 @@ checks each eligible chat call against your [CollieAi](https://collieai.io)
 policy, before and after the model call. By default it runs in **Monitor**
 mode: it never changes or blocks a call, and never delays one beyond its own
 deadline. What CollieAi found goes into LiteLLM's guardrail log and
-CollieAi's Logs. A pilot **block** mode refuses the calls your policy
-blocks: see [Blocking (pilot)](#blocking-pilot).
+CollieAi's Logs. **Block** mode refuses the calls your policy blocks: see
+[Blocking](#blocking).
 
 You need a CollieAi project and its API key (`clai_…`). Rule support is
 decided by CollieAi's server execution profile, not by this adapter: read
 [Your project's policy](#your-projects-policy) before you start.
 
-- **Tested with:** LiteLLM proxy 1.102.4 and 1.106.4, Python ≥ 3.11. Use
-  1.102.2 or later: 1.102.0 and 1.102.1 carry the critical advisory
-  GHSA-7hp6-4w63-5g45. Other LiteLLM versions are untested.
+- **Tested with:** LiteLLM proxy 1.102.4, 1.106.4 and 1.106.5, Python
+  ≥ 3.11; other LiteLLM versions are untested. Don't use 1.102.0 or
+  1.102.1: they carry the critical advisory GHSA-7hp6-4w63-5g45.
 - **Depends on:** `httpx`, which LiteLLM already has. Nothing else.
 
 ## Install
@@ -39,7 +39,7 @@ RUN python3 -m ensurepip \
  && python3 -m pip install --no-cache-dir collieai-litellm-guardrail
 ```
 
-Checked with the `v1.102.4`, `v1.106.0` and `v1.106.4` images.
+Checked with the `v1.102.4`, `v1.106.0`, `v1.106.4` and `v1.106.5` images.
 
 ## Configure
 
@@ -66,7 +66,7 @@ guardrails:
 | `forward_conversation_id` | `false` | Forward the caller's `x-collieai-conversation-id` header, and only that header |
 | `summary_interval_s` | 60 | How often each worker logs its counts |
 | `synthetic_interval_s` | 300 | How often each worker runs the synthetic check; it also runs at start. `0` turns it off |
-| `enforcement_mode` | `monitor` | `monitor` observes only. `block` refuses the calls your policy blocks — a pilot, see [Blocking (pilot)](#blocking-pilot) |
+| `enforcement_mode` | `monitor` | `monitor` observes only. `block` refuses the calls your policy blocks, see [Blocking](#blocking) |
 
 Keep `mode: [pre_call, post_call]` and `default_on: true`. Otherwise one
 phase, or the calls that don't name the guardrail, are not observed. The
@@ -88,32 +88,63 @@ LiteLLM's own handling of a guardrail's bad setting is different: it logs
 one ERROR, `Skipping guardrail …`, and starts the proxy without the
 guardrail. The adapter's error is not of the kind LiteLLM skips, so the
 start stops instead of running unobserved. Two cases stay LiteLLM's:
-- an entry without `mode` is skipped that way before the adapter is built;
+- an entry LiteLLM itself refuses — no `mode`, or a value of the wrong
+  type such as `default_on: maybe` — is skipped that way before the
+  adapter is built;
 - a misspelled setting is passed on like any other key, so the adapter
   doesn't see it and uses the default.
 
-## Blocking (pilot)
+In block mode the readiness guard turns the first into refused calls,
+and of the second a misspelled `enforcement_mode`: see
+[Blocking](#blocking). Other misspelled settings still fall back to their
+defaults.
+
+## Blocking
 
 With `enforcement_mode: block` the adapter refuses a call instead of only
-observing it. This is a pilot: run it on a test project, not on your
-users' traffic yet. The proxy's workers do not yet refuse traffic while the
-guardrail is not wired in them, so a worker whose guardrail failed to load
-lets calls through unchecked.
+observing it. Every check that can't be made refuses its call too, so
+check [the capacity](#capacity) against your traffic, and try the policy on
+a test project before your users' calls go through it.
 
 ```yaml
+litellm_settings:
+  callbacks: ["collieai_guardrail.guardrail.require_guardrail"]
+
+guardrails:
+  - guardrail_name: collieai-block
+    litellm_params:
+      # ... the entry above (the name is only a label), and:
       enforcement_mode: block
 ```
 
-It needs `mode: [pre_call, post_call]` and `default_on: true`: without
-them the proxy does not start. The CollieAi host must allow blocking, and
-the project's active policy must be in **Enforce**; otherwise every check
-is refused and so is every call (`503`).
+Block mode needs:
+- `mode: [pre_call, post_call]` and `default_on: true` — not a mode by
+  tags, and no LiteLLM `stream_scope` but `both`: each runs a phase only
+  for some calls;
+- the readiness guard, `collieai_guardrail.guardrail.require_guardrail`,
+  in `litellm_settings.callbacks`.
+
+Without them the proxy does not start.
+
+The guard refuses every call (`503`, `CollieAi guardrail not loaded
+(guardrail_not_loaded)`) while the proxy worker has no CollieAi guardrail
+in block mode, and logs an ERROR that says so. One such guardrail is
+enough: with two block entries, a skipped one goes unnoticed while the
+other runs. LiteLLM starts without a
+guardrail whose entry it refuses — no `mode`, a value of the wrong type —
+and a misspelled `enforcement_mode` leaves the adapter in Monitor; with the
+guard, both refuse the calls instead of letting them through unchecked.
+
+The CollieAi host must allow blocking, and the project's active policy must
+be in **Enforce**; otherwise every check is refused and so is every call
+(`503`).
 
 | What happens | The client gets | LiteLLM's record |
 |---|---|---|
 | A rule of the policy blocks the request | `400`, `Request blocked by the CollieAi policy (content_blocked)`. The model is not called | `guardrail_intervened`, `guardrail_action: "BLOCKED"`, the rule types in `violation_categories` |
 | A rule blocks the model's reply | `400`, `Response blocked by the CollieAi policy (response_blocked)`. The model was called and its tokens are spent; its text is not sent | same |
-| The check could not be made: CollieAi unreachable, the deadline, `busy`, any error | `503`, `CollieAi guardrail unavailable (guardrail_unavailable)` | `guardrail_failed_to_respond`, `"BLOCKED"` |
+| The check could not be made: CollieAi unreachable, the deadline, `busy`, any other error | `503`, `CollieAi guardrail unavailable (guardrail_unavailable)` | `guardrail_failed_to_respond`, `"BLOCKED"` |
+| The request is over the limits CollieAi checks, or of a text shape it doesn't take (bypass `limit`, `shape`) | `400`, `… (unsupported_request)`; `(unsupported_response)` for the model's reply | `guardrail_intervened`, `"BLOCKED"` |
 | A call outside what the adapter checks: streaming, tools, more than one choice, non-text input, audio or other non-text output asked of the model, reasoning, Responses, `/v1/messages`, pass-through routes, any other call type | `400`, `… (unsupported_request)` before the model; `(unsupported_response)` for a reply outside it | `guardrail_intervened`, `"BLOCKED"` |
 | Embeddings, rerank, moderation | passes unchecked | `not_run` |
 | Nothing blocks | the call goes on unchanged | as in Monitor |
@@ -136,18 +167,43 @@ What does not block:
   block on an error blocks (its finding is an operational failure, with no
   category), one set to allow lets the call through.
 
-To go back to observing, set `enforcement_mode: monitor` and reload the
-proxy. Turning blocking off on the CollieAi side, or switching the policy
-to Monitor, refuses every call until you do.
+To go back to observing, set `enforcement_mode: monitor`, take the guard
+out of `litellm_settings.callbacks` and reload the proxy: the guard refuses
+every call while no guardrail is in block mode. Turning blocking off on the
+CollieAi side, or switching the policy to Monitor, refuses every call until
+you do.
+
+### Capacity
+
+app.collieai.io checks up to **8 checks a second** in block with the
+Starter policy: four chat calls a second, each checked before and after
+the model. That is the host's capacity for all the LiteLLM traffic it
+checks, not a quota of your project. Measured on app.collieai.io on
+2026-10-29, at 8 a second through a LiteLLM proxy and the other rates
+against the server directly:
+
+| Checks a second | Refused |
+|---|---|
+| 6 | none of 1,080 |
+| 8 | 2 of 2,352 (0.09 %) |
+| 10 | 2 of 1,800 (0.11 %) |
+| 12 | 32 of 2,160 (1.5 %) |
+
+A check that finds its CollieAi worker busy waits for it briefly, within
+its budget, before it is refused. Past the capacity more checks are refused
+— each a `503` to the caller in block mode, a bypass `busy` or `deadline`
+in Monitor — and none waits past the adapter's deadline. Rules that call a
+model (`llm_detection`, `qwen3guard_stream`) take the most of a check's
+time.
 
 ## Your project's policy
 
 With CollieAi's `stage1a-monitor-all-v2` server profile, which
-app.collieai.io runs, the beta runs every message rule selected for the
+app.collieai.io runs, the server runs every message rule selected for the
 phase: Input rules for pre-call and Output rules for post-call. The adapter
 has no list of rule types to run. In Monitor a finding is reported but
 never changes the model request or response; in block mode a rule's block
-refuses the call ([Blocking (pilot)](#blocking-pilot)).
+refuses the call ([Blocking](#blocking)).
 
 The server admits the complete selected policy before the first detector. If
 one configuration is unsafe for synchronous execution or needs input the
@@ -185,7 +241,7 @@ configuration is admitted by the server profile:
    `aho_corasick` and `normalization` without `trim_punctuation`.
 2. Send a test request through the proxy. The next summary must show
    `completed` for both phases. `bypass:capability` means a rule is still
-   outside what the beta runs.
+   outside what the server runs.
 
 ## What it checks
 
@@ -249,7 +305,7 @@ Only a `detection` flags the check.
 | `guardrail_failed_to_respond` | No `detection`, and some rule did not run (coverage `degraded`): no full answer. Or a bypass: no check |
 | `success` | No `detection`, and every rule that applies ran |
 | `not_run` | Outside the supported profile, and the call went through unchanged: in Monitor any such call, in block mode embeddings, rerank and moderation |
-| `guardrail_intervened` | Block mode: the call was refused — a rule blocked it, or it is outside the supported profile |
+| `guardrail_intervened` | Block mode: the call was refused — a rule blocked it, or it is outside the supported profile or over its limits |
 
 A CollieAi server before 2026.10.23 names no kind. With it,
 `guardrail_flagged` means Enforce would mask or block, as in 0.1.0.
@@ -312,9 +368,11 @@ Every line but the summary ends with `(guardrail <name>)`, the
 | `… LiteLLM logged N eligible calls and the hook has never run …` | WARNING: the guardrail is not wired for that phase |
 | `collieai guardrail synthetic check: …` | INFO when both phases completed, or when CollieAi answered `busy` and the check will be repeated; WARNING with each phase's reason otherwise |
 | `… LiteLLM no longer has this instance among its callbacks …` | INFO: the guardrail was deleted or rebuilt; see [Turning it off](#turning-it-off) |
+| `collieai guardrail synthetic check failed in enforcement_mode block …` | ERROR: in block mode the calls are likely refused the same way (`503`) |
+| `collieai guardrail readiness: no CollieAi guardrail in enforcement_mode block is loaded …` | ERROR from the readiness guard, at most once a minute per worker: every call is refused (`503 guardrail_not_loaded`); its tail names the guard, `(guardrail collieai-readiness)` |
 
-`httpx` logs each request's URL at INFO under its own logger. It carries no
-key or content.
+`httpx` logs each request's URL at INFO under its own logger, which a stock
+proxy does not show. It carries no key or content.
 
 A stock proxy gives handlers only to LiteLLM's own loggers, and the INFO
 lines above would show nowhere. So the adapter sets up its logger itself:
@@ -385,14 +443,15 @@ trigger it.
    `busy`, the adapter logs it at INFO and repeats the check 1.5–3 s later,
    up to twice. A WARNING names what failed: `bypass:auth` for a wrong key,
    `bypass:not_found` when the route is off, `bypass:capability` with the
-   code and the rule when the project's policy has a rule this beta doesn't
-   run, `bypass:transport`
-   when the server can't be reached, `bypass:busy` when CollieAi had no free
-   slot three times in a row.
+   code and the rule when the project's policy has a rule the server doesn't
+   run, `bypass:transport` when the server's host can't be resolved or
+   refuses the connection, `bypass:timeout` (`detail=deadline`) when it
+   doesn't answer in time, `bypass:busy` when CollieAi had no free slot
+   three times in a row.
 2. **Within a minute of start**, each worker writes a
    `collieai guardrail summary` line. If there is none, the adapter is not
    loaded. Look for LiteLLM's ERROR `Skipping guardrail` (an entry without
-   `mode`), or check whether something set the `collieai_guardrail` logger
+   `mode`, or a value of the wrong type), or check whether something set the `collieai_guardrail` logger
    above INFO.
 3. **After a test request** through the proxy, the summary shows `completed`
    for both phases.
@@ -408,26 +467,29 @@ trigger it.
   returns reasoning, post-call checks nothing, and its `coverage` is `null`.
 - **A phase holds at most 32 texts, 4,096 characters each and 16,384 in
   all.** Pre-call sends the text of every message, the history included, so
-  a long conversation is bypassed as `limit`. These are the limits of the
+  a long conversation is bypassed as `limit`, and in block mode refused
+  (`400`). These are the limits of the
   narrow profile, which app.collieai.io runs, and the default
   `max_body_bytes` matches them. A self-hosted CollieAi on the wide profile
   takes 64 texts and 131,072 characters; set `max_body_bytes: 3211264`
   there.
 - **Counts are per worker process**, and they reset when the worker restarts.
-- **A burst beyond CollieAi's capacity is `busy`.** Each CollieAi API
-  process checks one call at a time and answers the next `busy`. The
+- **A burst beyond CollieAi's capacity is `busy`.** A check that finds its
+  CollieAi worker busy waits for it briefly, then is answered `busy`. The
   adapter counts it as a bypass, and the call goes on unchanged — in block
-  mode it is refused (`503`). If the summary shows a lasting `busy` share,
-  tell CollieAi support.
+  mode it is refused (`503`). See [Capacity](#capacity). If the summary
+  shows a lasting `busy` share, tell CollieAi support.
 
 ## Turning it off
 
 Remove the guardrail entry and reload the proxy. Calls then go on as before.
+In block mode, take the readiness guard out of `litellm_settings.callbacks`
+in the same reload, or every call is refused (`503 guardrail_not_loaded`).
 
-You can also delete or change the guardrail through LiteLLM's API, without
-a reload. A change builds a new instance. The old instance then retires
-within `summary_interval_s`, even if it was deleted right after it was
-added:
+LiteLLM's guardrail API manages the guardrails kept in its database; this
+adapter is loaded from `config.yaml` only. If LiteLLM drops an instance
+from its callbacks, the instance retires within `summary_interval_s`, even
+if it was dropped right after it was added:
 - it logs one INFO line;
 - it stops its summary and synthetic check;
 - one deadline later, it closes its connections.

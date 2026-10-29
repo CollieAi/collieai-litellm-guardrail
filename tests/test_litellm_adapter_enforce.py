@@ -22,11 +22,12 @@ from litellm.exceptions import GuardrailRaisedException  # noqa: E402
 from litellm.proxy._types import UserAPIKeyAuth  # noqa: E402
 from litellm.proxy.guardrails.init_guardrails import init_guardrails_v2  # noqa: E402
 from litellm.proxy.utils import ProxyLogging  # noqa: E402
+from litellm.types.guardrails import GuardrailEventHooks, Mode  # noqa: E402
 
 import collieai_guardrail.observer as observer_module  # noqa: E402
 from collieai_guardrail.config import AdapterConfig, ConfigError  # noqa: E402
 from collieai_guardrail.counters import Counters  # noqa: E402
-from collieai_guardrail.guardrail import CollieAIGuardrail  # noqa: E402
+from collieai_guardrail.guardrail import CollieAIGuardrail, require_guardrail  # noqa: E402
 from collieai_guardrail.heartbeat import Heartbeat  # noqa: E402
 from collieai_guardrail.litellm_data import (  # noqa: E402
     LoggedCalls,
@@ -45,6 +46,7 @@ from litellm_contract import (  # noqa: E402
     chat_request,
     chat_response,
     check_reply,
+    enforce_reply,
     error_body,
     json_reply,
     never_answers,
@@ -52,45 +54,6 @@ from litellm_contract import (  # noqa: E402
 
 FACTS = CallFacts(operation_id="op-1")
 HANDLER = registry.IN_MEMORY_GUARDRAIL_HANDLER
-
-
-def enforce_reply(phase: str = "pre_call", items: int = 3, *, blocked: bool = False) -> dict[str, Any]:
-    """The route's enforce reply: `NONE` in `enforce`, or `BLOCKED` stopped at the first item."""
-    reply = check_reply(phase, items, found=False)
-    collieai = reply["collieai"]
-    collieai["mode"] = "enforce"
-    if not blocked:
-        return reply
-    reply["action"] = "BLOCKED"
-    reply["blocked_reason"] = "Request blocked by the CollieAi policy"
-    collieai["terminal"] = "blocked"
-    collieai["coverage"].update(state="incomplete", items_judged=1)
-    collieai["items"] = [
-        {
-            "index": 0,
-            "source": "structured_messages[0].content",
-            "outcome": "block",
-            "findings": [
-                {
-                    "rule_id": "rule-b",
-                    "rule_type": "aho_corasick",
-                    "action": "block",
-                    "mode": "enforce",
-                    "kind": "detection",
-                    "no_enforce_reason": None,
-                },
-                {
-                    "rule_id": "rule-m",
-                    "rule_type": "structured_id",
-                    "action": "mask",
-                    "mode": "monitor",
-                    "kind": "detection",
-                    "no_enforce_reason": "surface_mask_unsupported",
-                },
-            ],
-        }
-    ]
-    return reply
 
 
 def _body(reply: dict[str, Any]) -> bytes:
@@ -129,6 +92,51 @@ def test_block_needs_both_phases_and_default_on(params: dict[str, Any], message:
     """A phase the adapter does not see, or a request that does not name it, would go through unchecked."""
     with pytest.raises(ConfigError, match=message):
         CollieAIGuardrail(api_base=API_BASE, api_key=API_KEY, enforcement_mode="block", **params)
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [Mode(tags={"lax": "pre_call"}, default=["pre_call", "post_call"]), Mode(tags={"all": ["pre_call", "post_call"]})],
+    ids=["a tag with one phase", "no default"],
+)
+def test_block_refuses_a_mode_by_tags(mode: Mode) -> None:
+    """A tag that names one phase skips the other for its calls, a mode with no default skips the untagged ones, and
+    the caller sends a request's tags."""
+    with pytest.raises(ConfigError, match="not a mode by tags"):
+        CollieAIGuardrail(
+            api_base=API_BASE, api_key=API_KEY, enforcement_mode="block", event_hook=mode, default_on=True
+        )
+
+
+@pytest.mark.parametrize("scope", ["non_streaming", "streaming", {"pre_call": "non_streaming"}, {"pre_call": "both"}])
+async def test_block_refuses_a_stream_scope_but_both(monkeypatch: pytest.MonkeyPatch, scope: object) -> None:
+    """LiteLLM's `stream_scope` runs a phase only for streaming calls or only for the others."""
+    monkeypatch.setattr(litellm, "callbacks", [*litellm.callbacks, require_guardrail])
+    block = CollieAIGuardrail(
+        api_base=API_BASE,
+        api_key=API_KEY,
+        enforcement_mode="block",
+        event_hook=["pre_call", "post_call"],
+        default_on=True,
+        synthetic_interval_s=0,
+    )
+    monitor = CollieAIGuardrail(
+        api_base=API_BASE,
+        api_key=API_KEY,
+        event_hook=["pre_call", "post_call"],
+        default_on=True,
+        synthetic_interval_s=0,
+    )
+    try:
+        with pytest.raises(ConfigError, match="needs stream_scope unset or both"):
+            block.apply_stream_scope(scope)
+        block.apply_stream_scope("both")
+        block.apply_stream_scope(None)
+        monitor.apply_stream_scope(scope)  # Monitor observes what LiteLLM gives it
+    finally:
+        for guardrail in (block, monitor):
+            await guardrail.heartbeat.stop()
+            await guardrail.observer.aclose()
 
 
 # ------------------------------------------------------------------ the request
@@ -282,6 +290,55 @@ async def test_a_check_not_made_refuses_the_call(respond: Any) -> None:
 
 
 @pytest.mark.parametrize(
+    "respond",
+    [
+        json_reply(413, error_body("limit", "body_too_large")),
+        json_reply(422, error_body("limit", "max_total_chars")),
+        json_reply(422, error_body("shape", "unsupported_text_shape")),
+    ],
+    ids=["body_too_large", "text_limit", "shape"],
+)
+async def test_a_request_the_profile_does_not_take_is_a_400_not_to_retry(respond: Any) -> None:
+    """The same call meets its limit or shape again: refused as outside what the adapter checks, not as a check that
+    may be retried; the bypass keeps its reason."""
+    observer = _observer(MockServer(respond))
+
+    before = await observer.observe_request(chat_request(), call_type="acompletion", facts=FACTS)
+    after = await observer.observe_response(chat_request(), chat_response(), call_type="acompletion", facts=FACTS)
+
+    assert (before.result, before.refusal) == ("bypass", (400, "unsupported_request"))
+    assert (after.result, after.refusal) == ("bypass", (400, "unsupported_response"))
+    assert (before.guardrail_status, before.guardrail_action) == ("guardrail_intervened", "BLOCKED")
+    snapshot = observer.counters.snapshot()
+    assert snapshot["pre_call"]["refused"] == {"unsupported_request": 1}
+    assert snapshot["pre_call"]["bypass"] in ({"limit": 1}, {"shape": 1})
+
+
+async def test_a_body_over_its_cap_is_refused_unsent_with_a_400() -> None:
+    server = MockServer(json_reply(200, enforce_reply()))
+    observer = _observer(server, max_body_bytes=1024)
+
+    outcome = await observer.observe_request(
+        chat_request(messages=[{"role": "user", "content": "x" * 2000}]), call_type="acompletion", facts=FACTS
+    )
+
+    assert (outcome.reason, outcome.detail, outcome.refusal) == (
+        "limit",
+        "body_over_limit",
+        (400, "unsupported_request"),
+    )
+    assert server.requests == []
+
+
+async def test_monitor_never_refuses_a_request_over_the_limits() -> None:
+    observer = _observer(MockServer(json_reply(413, error_body("limit", "body_too_large"))), mode="monitor")
+
+    outcome = await observer.observe_request(chat_request(), call_type="acompletion", facts=FACTS)
+
+    assert (outcome.result, outcome.reason, outcome.refusal) == ("bypass", "limit", None)
+
+
+@pytest.mark.parametrize(
     ("request_", "call_type"),
     [
         (chat_request(stream=True), "acompletion"),
@@ -385,6 +442,7 @@ def _forget_ours() -> list[CollieAIGuardrail]:
 @pytest.fixture
 async def loaded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[Any]:
     _forget_ours()
+    monkeypatch.setattr(litellm, "callbacks", [*litellm.callbacks, require_guardrail])  # block needs the guard
 
     def make(server: MockServer, **params: Any) -> CollieAIGuardrail:
         monkeypatch.setattr(observer_module, "new_client", server.client)
@@ -415,6 +473,18 @@ async def test_litellms_dispatch_refuses_a_blocked_call_and_the_record_says_so(l
     assert "(content_blocked)" in str(caught.value) and "4111" not in str(caught.value)
     [record] = _guardrail_records(data)
     assert (record["guardrail_status"], record["guardrail_action"]) == ("guardrail_intervened", "BLOCKED")
+
+
+@pytest.mark.parametrize("scope", ["non_streaming", {"pre_call": "non_streaming"}])
+async def test_a_stream_scope_never_leaves_a_streaming_call_unchecked(loaded: Any, scope: object) -> None:
+    """Through LiteLLM's loader: where LiteLLM has `stream_scope` (1.106) the proxy does not start with it; where it
+    has none (1.102) the guardrail still runs for a streaming call, which block refuses as outside what it checks."""
+    try:
+        guardrail = loaded(MockServer(json_reply(200, enforce_reply())), stream_scope=scope)
+    except ConfigError:
+        return
+    streaming = {**copy.deepcopy(chat_request()), "stream": True}
+    assert guardrail.should_run_guardrail(streaming, GuardrailEventHooks.pre_call)
 
 
 async def test_a_check_not_made_is_a_503(loaded: Any) -> None:
