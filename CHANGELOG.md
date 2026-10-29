@@ -2,9 +2,8 @@
 
 ## 1.0.0 — 2026-10-29
 
-- Block mode is no longer a pilot. The README gives app.collieai.io's
-  capacity in block — up to 8 checks a second with the Starter policy —
-  and what a call gets past it.
+- Block mode is no longer a pilot. The README says what a call gets when
+  CollieAi's capacity is reached.
 - `enforcement_mode: block` does not start with a mode by tags, or with a
   LiteLLM `stream_scope` other than `both` (LiteLLM 1.106): each runs a
   phase only for some calls, and the others went through unchecked.

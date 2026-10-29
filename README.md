@@ -102,9 +102,9 @@ defaults.
 ## Blocking
 
 With `enforcement_mode: block` the adapter refuses a call instead of only
-observing it. Every check that can't be made refuses its call too, so
-check [the capacity](#capacity) against your traffic, and try the policy on
-a test project before your users' calls go through it.
+observing it. Every check that can't be made refuses its call too: read
+[Capacity](#capacity), and try the policy on a test project before your
+users' calls go through it.
 
 ```yaml
 litellm_settings:
@@ -175,26 +175,12 @@ you do.
 
 ### Capacity
 
-app.collieai.io checks up to **8 checks a second** in block with the
-Starter policy: four chat calls a second, each checked before and after
-the model. That is the host's capacity for all the LiteLLM traffic it
-checks, not a quota of your project. Measured on app.collieai.io on
-2026-10-29, at 8 a second through a LiteLLM proxy and the other rates
-against the server directly:
-
-| Checks a second | Refused |
-|---|---|
-| 6 | none of 1,080 |
-| 8 | 2 of 2,352 (0.09 %) |
-| 10 | 2 of 1,800 (0.11 %) |
-| 12 | 32 of 2,160 (1.5 %) |
-
-A check that finds its CollieAi worker busy waits for it briefly, within
-its budget, before it is refused. Past the capacity more checks are refused
-— each a `503` to the caller in block mode, a bypass `busy` or `deadline`
-in Monitor — and none waits past the adapter's deadline. Rules that call a
-model (`llm_detection`, `qwen3guard_stream`) take the most of a check's
-time.
+CollieAi's capacity for checks is shared and finite. A check that finds its
+CollieAi worker busy waits for it briefly, within its budget; past that it
+is refused — a `503` to the caller in block mode, a bypass `busy` or
+`deadline` in Monitor. No call waits past the adapter's deadline. Before
+your production traffic goes through block mode, tell CollieAi the rate you
+expect.
 
 ## Your project's policy
 
